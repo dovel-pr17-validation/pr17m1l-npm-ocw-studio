@@ -1,0 +1,1109 @@
+"""Tests for websites API functionality"""
+
+from unittest.mock import patch
+from uuid import UUID
+
+import factory
+import pytest
+from mitol.common.utils import now_in_utc
+
+from content_sync.constants import VERSION_DRAFT, VERSION_LIVE
+from users.factories import UserFactory
+from videos.constants import YT_THUMBNAIL_IMG
+from websites.api import (
+    auto_link_video_captions_transcript,
+    detect_mime_type,
+    fetch_website,
+    get_content_warnings,
+    get_short_id,
+    get_valid_new_filename,
+    get_valid_new_slug,
+    get_website_in_root_website_metadata,
+    is_ocw_site,
+    mail_on_publish,
+    sync_website_content_references,
+    unlink_deleted_resource_from_videos,
+    update_website_status,
+    update_youtube_thumbnail,
+    videos_missing_captions,
+    videos_with_truncatable_text,
+    videos_with_unassigned_youtube_ids,
+)
+from websites.constants import (
+    CONTENT_TYPE_RESOURCE,
+    PUBLISH_STATUS_ERRORED,
+    PUBLISH_STATUS_STARTED,
+    PUBLISH_STATUS_SUCCEEDED,
+    RESOURCE_TYPE_IMAGE,
+    RESOURCE_TYPE_VIDEO,
+)
+from websites.factories import (
+    WebsiteContentFactory,
+    WebsiteFactory,
+    WebsiteStarterFactory,
+)
+from websites.messages import (
+    PreviewOrPublishFailureMessage,
+    PreviewOrPublishSuccessMessage,
+)
+from websites.models import Website
+
+pytestmark = pytest.mark.django_db
+
+EXAMPLE_UUID_STR = "ae6cfe0b-37a7-4fe6-b194-5b7f1e3c349e"
+
+
+@pytest.mark.parametrize("exclude_content", [True, False])
+@pytest.mark.parametrize(
+    ("filename_base", "existing_filenames", "exp_result_filename"),
+    [
+        ["my-title", [], "my-title"],  # noqa: PT007
+        ["my-title", ["my-title"], "my-title2"],  # noqa: PT007
+        ["my-title", ["my-title", "my-title9"], "my-title10"],  # noqa: PT007
+        [  # noqa: PT007
+            "my-long-title",
+            ["my-long-title", "my-long-title9"],
+            "my-long-titl10",
+        ],
+    ],
+)
+def test_websitecontent_autogen_filename_unique(
+    mocker, filename_base, existing_filenames, exp_result_filename, exclude_content
+):
+    """
+    get_valid_new_filename should return a filename that obeys uniqueness constraints, adding a suffix and
+    removing characters from the end of the string as necessary.
+    """
+    # Set a lower limit for max filename length to test that filenames are truncated appropriately
+    mocker.patch("websites.api.CONTENT_FILENAME_MAX_LEN", 14)
+    content_type = "page"
+    dirpath = "path/to"
+    website = WebsiteFactory.create()
+    contents = WebsiteContentFactory.create_batch(
+        len(existing_filenames),
+        website=website,
+        type=content_type,
+        dirpath=dirpath,
+        filename=factory.Iterator(existing_filenames),
+    )
+
+    exclude_text_id = contents[0].text_id if exclude_content and contents else None
+
+    assert get_valid_new_filename(
+        website_pk=website.pk,
+        dirpath=dirpath,
+        filename_base=filename_base,
+        exclude_text_id=exclude_text_id,
+    ) == (exp_result_filename if not exclude_content else filename_base)
+
+
+@pytest.mark.parametrize(
+    ("uuid_str", "filter_value"),
+    [
+        [  # noqa: PT007
+            "05d329fd-05ca-4770-b8b2-77ad711daca9",
+            "05d329fd-05ca-4770-b8b2-77ad711daca9",
+        ],
+        [  # noqa: PT007
+            "05d329fd-05ca-4770-b8b2-77ad711daca9",
+            "05d329fd05ca4770b8b277ad711daca9",
+        ],
+    ],
+)
+def test_fetch_website_by_uuid(uuid_str, filter_value):
+    """fetch_website should find a website based on uuid"""
+    website = WebsiteFactory.create(uuid=UUID(uuid_str, version=4))
+    result_website = fetch_website(filter_value)
+    assert website == result_website
+
+
+@pytest.mark.parametrize(
+    ("website_attrs", "filter_value"),
+    [
+        [{"title": "my test title"}, "my test title"],  # noqa: PT007
+        [{"name": "my test name"}, "my test name"],  # noqa: PT007
+        [{"short_id": "my.test.name"}, "my.test.name"],  # noqa: PT007
+        [  # noqa: PT007
+            {"title": "05d329fd-05ca-4770-b8b2-77ad711daca9"},
+            "05d329fd-05ca-4770-b8b2-77ad711daca9",
+        ],
+        [  # noqa: PT007
+            {"title": "abcdefg1-2345-6789-abcd-123456789abc"},
+            "abcdefg1-2345-6789-abcd-123456789abc",
+        ],
+    ],
+)
+def test_fetch_website_by_name_title(website_attrs, filter_value):
+    """fetch_website should find a website based on a name or title"""
+    website = WebsiteFactory.create(
+        uuid=UUID(EXAMPLE_UUID_STR, version=4), **website_attrs
+    )
+    result_website = fetch_website(filter_value)
+    assert website == result_website
+
+
+def test_fetch_website_not_found():
+    """fetch_website should raise if a matching website was not found"""
+    WebsiteFactory.create(
+        uuid=UUID(EXAMPLE_UUID_STR, version=4),
+        title="my title",
+        name="my name",
+    )
+    with pytest.raises(Website.DoesNotExist):
+        fetch_website("bad values")
+
+
+@pytest.mark.parametrize(
+    ("existing_slugs", "exp_result_slug"),
+    [
+        [[], "my-slug"],  # noqa: PT007
+        [["my-slug"], "my-slug2"],  # noqa: PT007
+        [["my-slug", "my-slug9"], "my-slug10"],  # noqa: PT007
+        [  # noqa: PT007
+            ["very-very-very-very-long-slug", "very-very-very-very-long-slug9"],
+            "very-very-very-very-long-slu10",
+        ],
+    ],
+)
+def test_websitestarter_autogen_slug_unique(existing_slugs, exp_result_slug):
+    """
+    get_valid_new_slug should return a slug that obeys uniqueness constraints, adding a suffix and
+    removing characters from the end of the string as necessary.
+    """
+    slug_base = exp_result_slug if not existing_slugs else existing_slugs[0]
+    for slug in existing_slugs:
+        WebsiteStarterFactory.create(
+            path=f"http://github.com/configs1/{slug}",
+            slug=slug,
+            source="github",
+            name=slug,
+            config={"collections": []},
+        )
+    assert (
+        get_valid_new_slug(
+            slug_base=slug_base, path=f"http://github.com/configs2/{slug_base}"
+        )
+        == exp_result_slug
+    )
+
+
+def test_is_ocw_site(settings):
+    """is_ocw_site() should return expected bool value for a website"""
+    settings.OCW_COURSE_STARTER_SLUG = "ocw-course-v2"
+    ocw_site = WebsiteFactory.create(
+        starter=WebsiteStarterFactory.create(slug="ocw-course-v2")
+    )
+    other_site = WebsiteFactory.create(
+        starter=WebsiteStarterFactory.create(slug="not-ocw-course")
+    )
+    assert is_ocw_site(ocw_site) is True
+    assert is_ocw_site(other_site) is False
+
+
+@pytest.mark.parametrize(
+    ("youtube_id", "existing_thumb", "overwrite", "expected_thumb"),
+    [
+        [  # noqa: PT007
+            None,
+            YT_THUMBNAIL_IMG.format(video_id="fake"),
+            True,
+            YT_THUMBNAIL_IMG.format(video_id="fake"),
+        ],
+        [  # noqa: PT007
+            "abc123",
+            YT_THUMBNAIL_IMG.format(video_id="def456"),
+            False,
+            YT_THUMBNAIL_IMG.format(video_id="def456"),
+        ],
+        [  # noqa: PT007
+            "abc123",
+            "",
+            False,
+            YT_THUMBNAIL_IMG.format(video_id="abc123"),
+        ],
+        [  # noqa: PT007
+            "abc123",
+            None,
+            False,
+            YT_THUMBNAIL_IMG.format(video_id="abc123"),
+        ],
+        [  # noqa: PT007
+            "abc123",
+            YT_THUMBNAIL_IMG.format(video_id="def456"),
+            True,
+            YT_THUMBNAIL_IMG.format(video_id="abc123"),
+        ],
+    ],
+)
+def test_update_youtube_thumbnail(
+    mocker, youtube_id, existing_thumb, overwrite, expected_thumb
+):
+    """The youtube thumbnail field should be set to the specified value if it exists"""
+    mocker.patch("websites.api.is_ocw_site", return_value=True)
+    website = WebsiteFactory.create()
+    metadata = {
+        "video_metadata": {"youtube_id": youtube_id},
+        "video_files": {"video_thumbnail_file": existing_thumb},
+    }
+    update_youtube_thumbnail(website.uuid, metadata, overwrite=overwrite)
+    assert metadata["video_files"]["video_thumbnail_file"] == expected_thumb
+
+
+@pytest.mark.parametrize("is_ocw", [True, False])
+def test_unassigned_youtube_ids(mocker, is_ocw):
+    """videos_with_unassigned_youtube_ids should return WebsiteContent objects for videos with no youtube ids"""
+    mocker.patch("websites.api.is_ocw_site", return_value=is_ocw)
+    website = WebsiteFactory.create()
+    WebsiteContentFactory.create_batch(
+        4,
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {"youtube_id": "abc123"},
+        },
+    )
+    videos_without_ids = []
+    videos_without_ids.append(
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={
+                "resourcetype": RESOURCE_TYPE_VIDEO,
+                "video_metadata": {},
+            },
+        )
+    )
+    for yt_id in [None, ""]:
+        videos_without_ids.append(  # noqa: PERF401
+            WebsiteContentFactory.create(
+                website=website,
+                metadata={
+                    "resourcetype": RESOURCE_TYPE_VIDEO,
+                    "video_metadata": {"youtube_id": yt_id},
+                },
+            )
+        )
+    WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_IMAGE,
+            "video_metadata": {"youtube_id": "bad_data"},
+        },
+    )
+    unassigned_content = videos_with_unassigned_youtube_ids(website)
+    if is_ocw:
+        assert len(unassigned_content) == 3
+        for content in videos_without_ids:
+            assert content in unassigned_content
+    else:
+        assert len(unassigned_content) == 0
+
+
+@pytest.mark.parametrize("is_ocw", [True, False])
+def test_videos_missing_captions(mocker, is_ocw):
+    """videos_missing_captions should return WebsiteContent objects for videos with no captions"""
+    mocker.patch("websites.api.is_ocw_site", return_value=is_ocw)
+    website = WebsiteFactory.create()
+    # Videos WITH captions: non-empty _resources relation content
+    WebsiteContentFactory.create_batch(
+        3,
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_files": {
+                "video_captions_resources": {
+                    "content": ["abc123"],
+                    "website": website.name,
+                }
+            },
+        },
+    )
+    videos_without_captions = [
+        # Relation key entirely absent
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        ),
+        # Site-config default: empty-string content
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={
+                "resourcetype": RESOURCE_TYPE_VIDEO,
+                "video_files": {
+                    "video_captions_resources": {"content": "", "website": ""}
+                },
+            },
+        ),
+        # Emptied list (e.g. after unlinking a deleted resource)
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={
+                "resourcetype": RESOURCE_TYPE_VIDEO,
+                "video_files": {
+                    "video_captions_resources": {
+                        "content": [],
+                        "website": website.name,
+                    }
+                },
+            },
+        ),
+        # Legacy scalar _file value only — no _resources relation
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={
+                "resourcetype": RESOURCE_TYPE_VIDEO,
+                "video_files": {"video_captions_file": "abc123"},
+            },
+        ),
+        # video_captions_resources present but has no "content" key at all
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={
+                "resourcetype": RESOURCE_TYPE_VIDEO,
+                "video_files": {"video_captions_resources": {"website": website.name}},
+            },
+        ),
+        # video_files key itself absent from metadata
+        WebsiteContentFactory.create(
+            website=website,
+            metadata={"resourcetype": RESOURCE_TYPE_VIDEO},
+        ),
+    ]
+    WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_IMAGE,
+            "video_files": {"video_captions_file": "bad_data"},
+        },
+    )
+
+    unassigned_content = videos_missing_captions(website)
+    if is_ocw:
+        assert len(unassigned_content) == len(videos_without_captions)
+        for content in videos_without_captions:
+            assert content in unassigned_content
+    else:
+        assert len(unassigned_content) == 0
+
+
+@pytest.mark.parametrize("is_ocw", [True, False])
+def test_videos_with_truncatable_text(mocker, is_ocw):
+    """Videos with titles or descriptions that are too long should be returned"""
+    mocker.patch("websites.api.is_ocw_site", return_value=is_ocw)
+    website = WebsiteFactory.create()
+    title_descs = (
+        (" ".join(["TooLongTitle" for _ in range(10)]), "desc"),
+        ("title", " ".join(["TooLongDescription" for _ in range(500)])),
+        ("title", "desc"),
+    )
+    resources = []
+    for title, desc in title_descs:
+        resources.append(
+            WebsiteContentFactory.create(
+                website=website,
+                title=title,
+                metadata={
+                    "resourcetype": RESOURCE_TYPE_VIDEO,
+                    "video_metadata": {"youtube_description": desc},
+                    "video_files": {"video_captions_file": "abc123"},
+                },
+            )
+        )
+    truncatable_content = videos_with_truncatable_text(website)
+    assert len(resources[1].metadata["video_metadata"]["youtube_description"]) > 5000
+
+    if is_ocw:
+        assert len(truncatable_content) == 2
+        for content in resources[0:2]:
+            assert content in truncatable_content
+    else:
+        assert truncatable_content == []
+
+
+@pytest.mark.parametrize("success", [True, False])
+@pytest.mark.parametrize("version", ["live", "draft"])
+def test_mail_on_publish(settings, mocker, success, version, permission_groups):
+    """mail_on_publish should send correct email to correct users"""
+    settings.OCW_STUDIO_LIVE_URL = "http://test.live.edu/"
+    settings.OCW_STUDIO_DRAFT_URL = "http://test.draft.edu"
+    mock_get_message_sender = mocker.patch("websites.api.get_message_sender")
+    mock_sender = mock_get_message_sender.return_value.__enter__.return_value
+    message = (
+        PreviewOrPublishSuccessMessage if success else PreviewOrPublishFailureMessage
+    )
+    website = permission_groups.websites[0]
+    user = UserFactory.create()
+    mail_on_publish(website.name, version, success, user.id)
+    mock_get_message_sender.assert_called_once_with(message)
+    mock_sender.build_and_send_message.assert_any_call(
+        user,
+        {
+            "site": {
+                "title": website.title,
+                "url": f"http://test.{version}.edu/{website.url_path}",
+            },
+            "version": version,
+        },
+    )
+
+
+def test_detect_mime_type(mocker):
+    """detect_mime_type should use python-magic to detect the mime type of an uploaded file"""
+    chunk = b"chunk"
+    chunks_mock = mocker.Mock(return_value=iter([chunk]))
+    uploaded_file = mocker.Mock(chunks=chunks_mock)
+    mime_type = "image/tiff"
+    magic_mock = mocker.patch("websites.api.Magic")
+    from_buffer_mock = magic_mock.return_value.from_buffer
+    from_buffer_mock.return_value = mime_type
+
+    assert detect_mime_type(uploaded_file) == mime_type
+    from_buffer_mock.assert_called_once_with(chunk)
+    chunks_mock.assert_called_once_with(chunk_size=2048)
+    magic_mock.assert_called_once_with(mime=True)
+
+
+@pytest.mark.parametrize(
+    ("status", "notify"),
+    [
+        [PUBLISH_STATUS_STARTED, False],  # noqa: PT007
+        [PUBLISH_STATUS_SUCCEEDED, True],  # noqa: PT007
+        [PUBLISH_STATUS_ERRORED, True],  # noqa: PT007
+    ],
+)
+@pytest.mark.parametrize("has_user", [True, False])
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+def test_update_website_status(mocker, status, notify, has_user, version):
+    """update_website_status should update the appropriate website publishing fields"""
+    mock_mail = mocker.patch("websites.api.mail_on_publish")
+    mock_log = mocker.patch("websites.api.log.error")
+    user = UserFactory.create() if has_user else None
+    website = WebsiteFactory.create(**{f"{version}_last_published_by": user})
+    now = now_in_utc()
+    update_website_status(website, version, status, now)
+    website.refresh_from_db()
+    assert getattr(website, f"{version}_publish_status") == status
+    assert getattr(website, f"{version}_publish_status_updated_on") == now
+    assert mock_mail.call_count == (1 if has_user and notify else 0)
+    assert mock_log.call_count == (1 if status == PUBLISH_STATUS_ERRORED else 0)
+
+
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+@patch("websites.api.mail_on_publish")
+def test_update_website_status_sends_notification(mock_mail_on_publish, version):
+    """
+    mail_on_publish should be called for a successful, studio-triggered publish
+    that is not a CDN cache step.
+    """
+    user = UserFactory.create()
+    website = WebsiteFactory.create(
+        **{
+            f"{version}_last_published_by": user,
+            f"latest_build_id_{version}": "787",
+        }
+    )
+    now = now_in_utc()
+    update_website_status(
+        website,
+        version,
+        PUBLISH_STATUS_SUCCEEDED,
+        now,
+        build_id="787",
+        is_cdn_cache_step=False,
+    )
+    mock_mail_on_publish.assert_called_once_with(
+        website.name,
+        version,
+        True,  # noqa: FBT003
+        user.id,
+    )
+
+
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+@patch("websites.api.mail_on_publish")
+def test_update_website_status_no_email_if_not_studio_publish(
+    mock_mail_on_publish, version
+):
+    """
+    mail_on_publish should not be called if the build_id does not match a
+    studio-initiated build ID.
+    """
+    user = UserFactory.create()
+    website = WebsiteFactory.create(**{f"{version}_last_published_by": user})
+    now = now_in_utc()
+    update_website_status(
+        website, version, PUBLISH_STATUS_SUCCEEDED, now, build_id="986"
+    )
+    mock_mail_on_publish.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+@patch("websites.api.mail_on_publish")
+def test_update_website_status_no_notification_cdn_cache_step(
+    mock_mail_on_publish, version
+):
+    """
+    mail_on_publish should not be called if is_cdn_cache_step is True.
+    """
+    user = UserFactory.create()
+    website = WebsiteFactory.create(
+        **{
+            f"{version}_last_published_by": user,
+            f"latest_build_id_{version}": "123",
+        }
+    )
+    now = now_in_utc()
+    update_website_status(
+        website,
+        version,
+        PUBLISH_STATUS_SUCCEEDED,
+        now,
+        build_id="123",
+        is_cdn_cache_step=True,
+    )
+    mock_mail_on_publish.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [PUBLISH_STATUS_SUCCEEDED, PUBLISH_STATUS_ERRORED])
+def test_update_website_unpublish_status(mocker, status):
+    """update_website_status should update the appropriate website publishing fields"""
+    mock_mail = mocker.patch("websites.api.mail_on_publish")
+    mock_log = mocker.patch("websites.api.log.error")
+    user = UserFactory.create()
+    website = WebsiteFactory.create(last_unpublished_by=user, unpublished=True)
+    now = now_in_utc()
+    update_website_status(website, VERSION_LIVE, status, now, unpublished=True)
+    website.refresh_from_db()
+    assert website.live_publish_status is None
+    assert website.live_publish_status_updated_on is None
+    assert website.unpublish_status_updated_on == now
+    assert website.unpublish_status == status
+    assert mock_mail.call_count == 0
+    assert mock_log.call_count == (1 if status == PUBLISH_STATUS_ERRORED else 0)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        PUBLISH_STATUS_STARTED,
+        PUBLISH_STATUS_SUCCEEDED,
+        PUBLISH_STATUS_ERRORED,
+    ],
+)
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+def test_update_unpublished_website_status(status, version):
+    """update_website_status should update an unpublished site appropriately"""
+    website = WebsiteFactory.create(not_published=True, draft_publish_date=None)
+    now = now_in_utc()
+    setattr(website, f"latest_build_id_{version}", 123)
+    update_website_status(website, version, status, now, build_id=123)
+    website.refresh_from_db()
+    assert getattr(website, f"{version}_publish_status") == status
+    assert getattr(website, f"{version}_publish_status_updated_on") == now
+
+    if status == PUBLISH_STATUS_SUCCEEDED:
+        assert getattr(website, f"{version}_build_date") == now
+        if version == VERSION_LIVE:
+            assert website.first_published_to_production == now
+    else:
+        assert getattr(website, f"{version}_build_date") is None
+
+
+@pytest.mark.parametrize("has_missing_ids", [True, False])
+@pytest.mark.parametrize("has_missing_captions", [True, False])
+@pytest.mark.parametrize("has_truncatable_text", [True, False])
+@pytest.mark.parametrize("is_draft", [True, False])
+def test_get_content_warnings(
+    mocker, has_missing_ids, has_missing_captions, has_truncatable_text, is_draft
+):
+    """get_content_warnings should return expected warning messages"""
+    website = WebsiteFactory.create()
+    video_content = WebsiteContentFactory.create_batch(3, website=website)
+    no_yt_ids = video_content[0:2] if has_missing_ids else []
+    no_caps = video_content[1:3] if has_missing_captions else []
+    truncatable_vids = [video_content[2]] if has_truncatable_text else []
+    # testing only for videos here, but warnings will be the same for any content type
+    draft_titles = [video_content[1]] if is_draft else []
+    mocker.patch(
+        "websites.api.videos_with_truncatable_text", return_value=truncatable_vids
+    )
+    mocker.patch(
+        "websites.api.videos_with_unassigned_youtube_ids",
+        return_value=no_yt_ids,
+    )
+    mocker.patch(
+        "websites.api.videos_missing_captions",
+        return_value=no_caps,
+    )
+    mocker.patch(
+        "websites.api.draft_content",
+        return_value=draft_titles,
+    )
+    warnings = get_content_warnings(website)
+    warnings_len = 0
+    if has_missing_ids:
+        warnings_len += 1
+        for content in no_yt_ids:
+            assert content.title in warnings[0]
+    if has_missing_captions:
+        warnings_len += 1
+        for content in no_caps:
+            assert content.title in warnings[1 if has_missing_ids else 0]
+    if has_truncatable_text:
+        warnings_len += 1
+        assert (
+            video_content[2].title
+            in warnings[int(has_missing_ids) + int(has_missing_captions)]
+        )
+    if is_draft:
+        warnings_len += 1
+        assert len(warnings) == warnings_len
+        assert video_content[1].title in warnings[warnings_len - 1]
+    if (
+        not has_missing_ids
+        and not has_missing_captions
+        and not has_truncatable_text
+        and not is_draft
+    ):
+        assert not warnings
+
+
+@pytest.mark.parametrize(
+    ("version", "site_fields", "expected_draft"),
+    [
+        (
+            # Publishing to live, but site previously published live.
+            VERSION_LIVE,
+            {},
+            False,
+        ),
+        (
+            # Publishing to live for first time
+            VERSION_LIVE,
+            {"publish_date": None},
+            False,
+        ),
+        (
+            # Publishing to draft, but site previously published live.
+            VERSION_DRAFT,
+            {"publish_date": now_in_utc()},
+            False,
+        ),
+        (
+            # Site is unbpublished.
+            VERSION_DRAFT,
+            {"unpublish_status": PUBLISH_STATUS_SUCCEEDED},
+            True,
+        ),
+        (
+            # Site is unbpublished.
+            VERSION_LIVE,
+            {"unpublish_status": PUBLISH_STATUS_SUCCEEDED},
+            True,
+        ),
+        (
+            # Site never published. OK to set to draft
+            VERSION_DRAFT,
+            {"publish_date": None},
+            True,
+        ),
+    ],
+)
+def test_get_website_in_root_website_metadata(version, site_fields, expected_draft):
+    """
+    Test that get_website_in_root_website_metadata returns the expected metadata,
+    especially in regards to draft status.
+    """
+    website = WebsiteFactory.create(**site_fields)
+    sitemetadata = WebsiteContentFactory.create(
+        website=website,
+        type="sitemetadata",
+        metadata={
+            "some": "field",
+        },
+    )
+
+    expected = {
+        **sitemetadata.metadata,
+        "url_path": website.url_path,
+        "_build": {"list": True, "render": False},
+    }
+    if expected_draft:
+        expected["draft"] = True
+
+    assert get_website_in_root_website_metadata(website, version) == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("course_num", "term", "year", "expected_id"),
+    [
+        ("6.0001", "", "", "6.0001"),
+        ("5.3", "Spring", "2022", "5.3-spring-2022"),
+        ("5.3", "Spring 2022", None, "5.3-spring-2022"),
+        ("5.3", "January IAP", "2011", "5.3-january-iap-2011"),
+        (
+            "18.650 (formerly 18.443) ",
+            "Spring",
+            "2015",
+            "18.650-spring-2015",
+        ),
+        (None, "January IAP", "2011", None),
+    ],
+)
+def test_get_short_id(course_num, term, year, expected_id):
+    """get_short_id should return expected values, or raise an error if no course number"""
+    metadata = {"primary_course_number": course_num, "term": term, "year": year}
+    if expected_id:
+        website = WebsiteFactory.create(short_id=expected_id)
+        short_id = get_short_id(website.name, metadata)
+        assert short_id == expected_id
+        for i in range(2, 5):
+            name = f"site_name_{i}"
+            website.short_id = get_short_id(website.name, metadata)
+            new_site = WebsiteFactory.create(
+                name=name, short_id=get_short_id(name, metadata)
+            )
+            assert new_site.short_id == f"{expected_id}-{i}"
+            assert website.short_id == expected_id
+    else:
+        with pytest.raises(ValueError, match="Primary course number is missing"):
+            get_short_id("random-name", metadata)
+
+
+# ── auto_link_video_captions_transcript ──────────────────────────────────────
+
+
+def test_auto_link_video_skips_non_video():
+    """auto_link_video_captions_transcript is a no-op for non-video resources."""
+    content = WebsiteContentFactory.create(
+        metadata={"resourcetype": "Image"},
+        filename="some-image",
+    )
+    auto_link_video_captions_transcript(content)
+    content.refresh_from_db()
+    assert content.metadata == {"resourcetype": "Image"}
+
+
+def test_auto_link_video_no_matching_captions():
+    """auto_link_video_captions_transcript makes no changes when no captions/transcript exist."""
+    website = WebsiteFactory.create()
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    assert video.metadata["video_files"] == {}
+
+
+def test_auto_link_video_links_existing_captions_and_transcript():
+    """auto_link_video_captions_transcript sets _resource fields from existing content."""
+    website = WebsiteFactory.create()
+    captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_vtt",
+        file=f"courses/{website.name}/lecture01_captions.vtt",
+    )
+    transcript = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_transcript_pdf",
+        file=f"courses/{website.name}/lecture01_transcript.pdf",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    vf = video.metadata["video_files"]
+    assert vf["video_captions_resources"] == {
+        "content": [str(captions.text_id)],
+        "website": website.name,
+    }
+    assert vf["video_transcript_resources"] == {
+        "content": [str(transcript.text_id)],
+        "website": website.name,
+    }
+    # Legacy _file fields in stored metadata are never written by auto-link
+    assert "video_captions_file" not in vf
+    assert "video_transcript_file" not in vf
+
+
+def test_auto_link_video_treats_empty_content_as_unset():
+    """_resource fields with empty-string content (site config default) are treated as unset."""
+    website = WebsiteFactory.create()
+    captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_vtt",
+        file=f"courses/{website.name}/lecture01_captions.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_files": {
+                # site-config-initialised empty relation — should be overwritten
+                "video_captions_resources": {"content": "", "website": website.name},
+            },
+        },
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    vf = video.metadata["video_files"]
+    assert vf["video_captions_resources"] == {
+        "content": [str(captions.text_id)],
+        "website": website.name,
+    }
+
+
+def test_auto_link_video_appends_new_without_overwriting_existing():
+    """New captions found by convention are appended to existing content list."""
+    website = WebsiteFactory.create()
+    existing_captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_fr_vtt",
+        file=f"courses/{website.name}/lecture01_captions_fr.vtt",
+    )
+    new_captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_en_vtt",
+        file=f"courses/{website.name}/lecture01_captions_en.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_files": {
+                "video_captions_resources": {
+                    "content": [str(existing_captions.text_id)],
+                    "website": website.name,
+                },
+            },
+        },
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    vf = video.metadata["video_files"]
+    # Existing id preserved, new id appended
+    assert str(existing_captions.text_id) in vf["video_captions_resources"]["content"]
+    assert str(new_captions.text_id) in vf["video_captions_resources"]["content"]
+    assert len(vf["video_captions_resources"]["content"]) == 2
+
+
+def test_auto_link_video_multi_language_captions():
+    """auto_link_video_captions_transcript links all language variants, not just English."""
+    website = WebsiteFactory.create()
+    captions_en = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions-en-us_vtt",
+        file=f"courses/{website.name}/lecture01_captions-en-US.vtt",
+    )
+    captions_fr = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions-fr-ca_vtt",
+        file=f"courses/{website.name}/lecture01_captions-fr-CA.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    vf = video.metadata["video_files"]
+    content = vf["video_captions_resources"]["content"]
+    assert str(captions_en.text_id) in content
+    assert str(captions_fr.text_id) in content
+    assert len(content) == 2
+    # Legacy _file fields in stored metadata are never written by auto-link
+    assert "video_captions_file" not in vf
+
+
+@pytest.mark.parametrize(
+    ("extension", "filename_suffix"),
+    [
+        ("vtt", "_vtt"),
+        ("webvtt", "_webvtt"),
+    ],
+)
+def test_auto_link_video_matches_all_caption_extensions(extension, filename_suffix):
+    """auto_link_video_captions_transcript finds captions regardless of extension.
+
+    Caption files may slugify to _vtt or _webvtt depending on the source
+    file's extension (e.g. 3Play produces .webvtt). Both must be found by
+    the video-side lookup, not just .vtt. srt is deliberately excluded -
+    it's not natively playable via the HTML5 <track> element.
+    """
+    website = WebsiteFactory.create()
+    captions = WebsiteContentFactory.create(
+        website=website,
+        filename=f"lecture01_captions-en-us{filename_suffix}",
+        file=f"courses/{website.name}/lecture01_captions-en-US.{extension}",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    vf = video.metadata["video_files"]
+    assert vf["video_captions_resources"]["content"] == [str(captions.text_id)]
+
+
+def test_auto_link_video_survives_filename_uniqueness_suffix():
+    """auto_link_video_captions_transcript still matches when Django's
+    filename-uniqueness logic has appended a bare digit to the colliding
+    filename (e.g. "..._vtt2").
+
+    This is the actual production bug: matching must rely on the resource's
+    real uploaded file extension, not the filename field, since
+    find_available_name can mutate the filename's tail with no separator.
+    """
+    website = WebsiteFactory.create()
+    # Simulates a second same-named upload: find_available_name would produce
+    # this exact filename by appending "2" directly onto "..._vtt" / "..._pdf".
+    captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions-en-us_vtt2",
+        file=f"courses/{website.name}/lecture01_captions-en-US.vtt",
+    )
+    transcript = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_transcript-en-us_pdf2",
+        file=f"courses/{website.name}/lecture01_transcript-en-US.pdf",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        filename="lecture01_mp4",
+    )
+    auto_link_video_captions_transcript(video)
+    video.refresh_from_db()
+    vf = video.metadata["video_files"]
+    assert vf["video_captions_resources"]["content"] == [str(captions.text_id)]
+    assert vf["video_transcript_resources"]["content"] == [str(transcript.text_id)]
+
+
+# ── unlink_deleted_resource_from_videos ──────────────────────────────────────
+
+
+def test_unlink_deleted_resource_removes_from_video_captions_resources():
+    """Deleting a linked caption resource removes it from the video's relation content."""
+    website = WebsiteFactory.create()
+    captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_vtt",
+        file=f"courses/{website.name}/lecture01_captions.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        type=CONTENT_TYPE_RESOURCE,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_files": {
+                "video_captions_resources": {
+                    "content": [str(captions.text_id)],
+                    "website": website.name,
+                }
+            },
+        },
+        filename="lecture01_mp4",
+    )
+    sync_website_content_references(video)
+    assert captions in video.referenced_by.all()
+
+    unlink_deleted_resource_from_videos(captions)
+
+    video.refresh_from_db()
+    assert video.metadata["video_files"]["video_captions_resources"]["content"] == []
+    assert captions not in video.referenced_by.all()
+
+
+def test_unlink_deleted_resource_removes_legacy_scalar_string_content():
+    """Deleting a resource linked via a legacy scalar-string content value still unlinks it."""
+    website = WebsiteFactory.create()
+    captions = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_vtt",
+        file=f"courses/{website.name}/lecture01_captions.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        type=CONTENT_TYPE_RESOURCE,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_files": {
+                "video_captions_resources": {
+                    "content": str(captions.text_id),
+                    "website": website.name,
+                }
+            },
+        },
+        filename="lecture01_mp4",
+    )
+    sync_website_content_references(video)
+
+    unlink_deleted_resource_from_videos(captions)
+
+    video.refresh_from_db()
+    assert video.metadata["video_files"]["video_captions_resources"]["content"] == []
+
+
+def test_unlink_deleted_resource_preserves_other_language():
+    """Deleting one language variant leaves other linked languages intact."""
+    website = WebsiteFactory.create()
+    captions_en = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_vtt",
+        file=f"courses/{website.name}/lecture01_captions.vtt",
+    )
+    captions_fr = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_fr_vtt",
+        file=f"courses/{website.name}/lecture01_captions_fr.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        type=CONTENT_TYPE_RESOURCE,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_files": {
+                "video_captions_resources": {
+                    "content": [str(captions_en.text_id), str(captions_fr.text_id)],
+                    "website": website.name,
+                }
+            },
+        },
+        filename="lecture01_mp4",
+    )
+    sync_website_content_references(video)
+
+    unlink_deleted_resource_from_videos(captions_en)
+
+    video.refresh_from_db()
+    assert video.metadata["video_files"]["video_captions_resources"]["content"] == [
+        str(captions_fr.text_id)
+    ]
+
+
+def test_unlink_deleted_resource_no_op_when_not_referenced():
+    """A resource that no video references is a no-op."""
+    website = WebsiteFactory.create()
+    orphan = WebsiteContentFactory.create(
+        website=website,
+        filename="lecture01_captions_vtt",
+        file=f"courses/{website.name}/lecture01_captions.vtt",
+    )
+    video = WebsiteContentFactory.create(
+        website=website,
+        metadata={"resourcetype": RESOURCE_TYPE_VIDEO, "video_files": {}},
+        filename="lecture01_mp4",
+    )
+    unlink_deleted_resource_from_videos(orphan)
+    video.refresh_from_db()
+    assert video.metadata["video_files"] == {}

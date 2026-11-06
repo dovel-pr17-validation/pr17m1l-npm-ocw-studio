@@ -1,0 +1,1460 @@
+"""Tests for link_to_external_resource.py"""
+
+from unittest.mock import patch
+from urllib.parse import urlparse
+
+import pytest
+from django.conf import settings
+
+from websites.constants import CONTENT_TYPE_EXTERNAL_RESOURCE, CONTENT_TYPE_NAVMENU
+from websites.factories import (
+    WebsiteContentFactory,
+    WebsiteFactory,
+    WebsiteStarterFactory,
+)
+from websites.management.commands.markdown_cleaning.cleaner import (
+    WebsiteContentMarkdownCleaner as Cleaner,
+)
+from websites.management.commands.markdown_cleaning.rules.link_to_external_resource import (
+    LinkToExternalResourceRule,
+    NavItemToExternalResourceRule,
+    build_external_resource,
+    get_or_build_external_resource,
+    is_ocw_domain_url,
+    unescape_link_text,
+)
+from websites.models import WebsiteContent
+from websites.site_config_api import SiteConfig
+
+SAMPLE_SITE_CONFIG = {
+    "collections": [
+        {
+            "category": "Content",
+            "fields": [
+                {
+                    "help": "The URL. For example, https://owl.english.purdue.edu/owl/resource/747/01/\n",
+                    "label": "URL",
+                    "name": "external_url",
+                    "required": True,
+                    "widget": "string",
+                },
+                {
+                    "default": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+                    "label": "License",
+                    "name": "license",
+                    "options": [
+                        {
+                            "label": "CC BY-NC-SA",
+                            "value": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+                        },
+                        {
+                            "label": "CC BY",
+                            "value": "https://creativecommons.org/licenses/by/4.0/",
+                        },
+                    ],
+                    "required": True,
+                    "widget": "select",
+                },
+                {
+                    "default": True,
+                    "help": "If true, user sees warning that external content is not covered by OCW licensing.\n",
+                    "label": "Include non-OCW licensing warning",
+                    "name": "has_external_license_warning",
+                    "required": True,
+                    "widget": "boolean",
+                },
+            ],
+            "folder": "content/external-resources",
+            "label": "External Resources",
+            "name": "external-resource",
+        },
+    ],
+    "root-url-path": "courses",
+    "site-url-format": "[sitemetadata:primary_course_number]-[sitemetadata:course_title]-[sitemetadata:term]-[sitemetadata:year]",
+}
+
+pytestmark = pytest.mark.django_db
+
+
+def get_cleaner(rule_type):
+    """Get cleaner for this test module."""
+    if rule_type == "markdown":
+        rule = LinkToExternalResourceRule()
+    else:
+        rule = NavItemToExternalResourceRule()
+
+    rule.set_options({"commit": True})
+
+    return Cleaner(rule)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_result"),
+    [
+        ("https://ocw.mit.edu", True),
+        ("https://google.com", False),
+    ],
+)
+@patch("django.conf.settings.SITEMAP_DOMAIN", "ocw.mit.edu")
+def test_is_ocw_domain_url(url, expected_result):
+    """Test is_ocw_domain_url."""
+    result = is_ocw_domain_url(url)
+    assert result == expected_result
+
+
+def test_build_external_resource():
+    """Test build_external_resource."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    title = "title"
+    url = "https://google.com"
+
+    external_resource = build_external_resource(
+        website=website,
+        site_config=SiteConfig(SAMPLE_SITE_CONFIG),
+        title=title,
+        url=url,
+    )
+
+    assert external_resource.title == title
+    assert external_resource.metadata["external_url"] == url
+    assert external_resource.metadata["has_external_license_warning"] is False
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("content_exists", [True, False])
+def test_get_or_build_external_resource(content_exists):
+    """Test get_or_build_external_resource builds or gets depending on content existence."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+        title = "title"
+        url = "https://google.com"
+        site_config = SiteConfig(SAMPLE_SITE_CONFIG)
+        config_item = site_config.find_item_by_name(CONTENT_TYPE_EXTERNAL_RESOURCE)
+
+        if content_exists:
+            existing_content = WebsiteContentFactory.create(
+                metadata={
+                    "external_url": url,
+                    "has_external_license_warning": True,
+                },
+                dirpath=config_item.file_target,
+                website=website,
+                type=CONTENT_TYPE_EXTERNAL_RESOURCE,
+                title=title,
+            )
+
+        external_resource = get_or_build_external_resource(
+            website=website,
+            site_config=SiteConfig(SAMPLE_SITE_CONFIG),
+            title=title,
+            url=url,
+        )
+
+    assert external_resource.title == title
+    assert external_resource.metadata["external_url"] == url
+    if content_exists:
+        assert external_resource.metadata["has_external_license_warning"] is True
+    else:
+        assert external_resource.metadata["has_external_license_warning"] is False
+
+    if content_exists:
+        assert existing_content.id == external_resource.id
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_content_template"),
+    [
+        (
+            R"""
+            ![image](https://example.com/image.jpg)
+            [invalid url](https://www.example website.com)
+            [internal url](/pages/page)
+            [OCW](https://ocw.mit.edu)
+            [OCW clone](https://ocw.mit.edu)
+            [OCW same but not so](https://ocw.mit.edu#fragment)
+            """,
+            R"""
+            ![image](https://example.com/image.jpg)
+            [invalid url](https://www.example website.com)
+            [internal url](/pages/page)
+            {{{{% resource_link "{text_id_1}" "OCW" %}}}}
+            {{{{% resource_link "{text_id_1}" "OCW clone" %}}}}
+            {{{{% resource_link "{text_id_2}" "OCW same but not so" %}}}}
+            """,
+        ),
+    ],
+)
+def test_link_to_external_resources(settings, content, expected_content_template):
+    """
+    Test link_to_external_resources correctly replaces links
+    with resource_link shortcode.
+    """
+    with patch(
+        "external_resources.signals.submit_url_to_wayback_task.delay", return_value=None
+    ):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        target_content = WebsiteContentFactory.create(
+            markdown=content,
+            website=website,
+            metadata={
+                "description": content,
+                "related_resources_text": content,
+                "optional_text": content,
+                "course_description": content,
+                "image_metadata": {
+                    "caption": content,
+                    "credit": content,
+                },
+            },
+        )
+
+        cleaner = get_cleaner("markdown")
+        cleaner.update_website_content(target_content)
+
+    wc_ocw = WebsiteContent.objects.get(title="OCW")
+    wc_ocw_2 = WebsiteContent.objects.get(title="OCW same but not so")
+
+    expected_content = expected_content_template.format(
+        text_id_1=wc_ocw.text_id, text_id_2=wc_ocw_2.text_id
+    )
+
+    assert target_content.markdown == expected_content
+
+    for field in [
+        "description",
+        "related_resources_text",
+        "optional_text",
+        "course_description",
+    ]:
+        assert target_content.metadata[field] == expected_content
+
+    for field in ["credit", "caption"]:
+        assert target_content.metadata["image_metadata"][field] == expected_content
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_content_template"),
+    [
+        (
+            [
+                {
+                    "name": "Nest",
+                    "url": "https://ocw.mit.edu",
+                    "weight": 10,
+                    "identifier": "external--760432549-1711617249481",
+                },
+                {
+                    "name": "Bird 1",
+                    "url": "https://ocw.mit.edu",
+                    "weight": 10,
+                    "identifier": "external--760432549-1711617249482",
+                    "parent": "external--760432549-1711617249481",
+                },
+                {
+                    "name": "Bird 2",
+                    "url": "https://ocw.mit.edu",
+                    "weight": 20,
+                    "identifier": "external--760432549-1711617249483",
+                    "parent": "external--760432549-1711617249481",
+                },
+                {
+                    "name": "Egg",
+                    "url": "https://ocw.mit.edu",
+                    "weight": 10,
+                    "identifier": "external--760432549-1711617249484",
+                    "parent": "external--760432549-1711617249483",
+                },
+                {
+                    "name": "Control",
+                    "weight": 20,
+                    "identifier": "f3d0ebae-7083-4524-9b93-f688537a0317",
+                },
+            ],
+            [
+                {"name": "Nest", "weight": 10, "identifier": "nest-id"},
+                {
+                    "name": "Bird 1",
+                    "weight": 10,
+                    "identifier": "bird-1-id",
+                    "parent": "nest-id",
+                },
+                {
+                    "name": "Bird 2",
+                    "weight": 20,
+                    "identifier": "bird-2-id",
+                    "parent": "nest-id",
+                },
+                {
+                    "name": "Egg",
+                    "weight": 10,
+                    "identifier": "egg-id",
+                    "parent": "bird-2-id",
+                },
+                {
+                    "name": "Control",
+                    "weight": 20,
+                    "identifier": "f3d0ebae-7083-4524-9b93-f688537a0317",
+                },
+            ],
+        ),
+    ],
+)
+def test_nav_item_to_external_resources(content, expected_content_template):
+    """Test nav_item_to_external_resource correctly converts external links to external resources."""
+    with patch(
+        "external_resources.signals.submit_url_to_wayback_task.delay", return_value=None
+    ):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+
+        target_content = WebsiteContentFactory.create(
+            website=website,
+            metadata={
+                "leftnav": content,
+            },
+        )
+
+        cleaner = get_cleaner("nav_item")
+        cleaner.update_website_content(target_content)
+
+    # Get all external resource content created by the rule
+    external_resources = WebsiteContent.objects.filter(
+        website=website, type=CONTENT_TYPE_EXTERNAL_RESOURCE
+    ).order_by("title")
+
+    # Since all nav items point to the same URL, they should all reference the same external resource
+    # The rule creates only one external resource per unique URL
+    assert external_resources.count() == 1
+    shared_resource = external_resources.first()
+
+    # All 4 nav items should now reference the same external resource
+    expected_content = expected_content_template
+    for item in expected_content:
+        if item["name"] == "Control":
+            continue
+        # All external nav items should now use the same resource identifier
+        item["identifier"] = shared_resource.text_id
+        # Update parent references to also use the shared resource identifier
+        if (
+            item.get("parent")
+            and item["parent"] != "f3d0ebae-7083-4524-9b93-f688537a0317"
+        ):
+            item["parent"] = shared_resource.text_id
+
+    assert target_content.metadata["leftnav"] == expected_content
+
+
+def test_rules_default_commit_value():
+    """Test that both rules properly handle options when set."""
+    link_rule = LinkToExternalResourceRule()
+    nav_rule = NavItemToExternalResourceRule()
+
+    # Set options using the inherited method
+    link_rule.set_options({"commit": True})
+    nav_rule.set_options({"commit": True})
+
+    # Verify options are set correctly
+    assert hasattr(link_rule, "options")
+    assert link_rule.options is not None
+    assert hasattr(nav_rule, "options")
+    assert nav_rule.options is not None
+    assert link_rule.options.get("commit", False) is True
+    assert nav_rule.options.get("commit", False) is True
+
+    # Test with False
+    link_rule.set_options({"commit": False})
+    nav_rule.set_options({"commit": False})
+
+    assert link_rule.options.get("commit", True) is False
+    assert nav_rule.options.get("commit", True) is False
+
+
+def test_link_to_external_resource_no_save_when_commit_false(mocker):
+    """Test that external resource is not saved when commit is False."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    mock_resource = mocker.Mock(spec=WebsiteContent)
+    mock_resource.text_id = "f3d0ebae-7083-4524-9b93-f688537a0317"
+    mock_resource.metadata = {"has_external_license_warning": True}
+
+    mocker.patch(
+        "websites.management.commands.markdown_cleaning.rules.link_to_external_resource.get_or_build_external_resource",
+        return_value=mock_resource,
+    )
+
+    rule = LinkToExternalResourceRule()
+    rule.set_options({"commit": False})
+
+    mock_starter = mocker.Mock()
+    mock_starter.slug = settings.OCW_COURSE_STARTER_SLUG
+    rule.starter_lookup.get_starter = mocker.Mock(return_value=mock_starter)
+
+    mock_toks = mocker.Mock()
+    mock_toks.link.destination = "https://example.com"
+    mock_toks.link.text = "Example Link"
+    mock_toks.link.is_image = False
+    mock_toks.original_text = "[Example Link](https://example.com)"
+
+    # Call replace_match
+    rule.replace_match("", 0, mock_toks, website_content)
+
+    # Verify save was not called
+    mock_resource.save.assert_not_called()
+    mock_resource.referencing_content.add.assert_not_called()
+
+
+def test_link_to_external_resource_no_save_when_commit_true(mocker):
+    """Test that external resource is not saved when commit is True."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    mock_resource = mocker.Mock(spec=WebsiteContent)
+    mock_resource.text_id = "f3d0ebae-7083-4524-9b93-f688537a0317"
+    mock_resource.metadata = {"has_external_license_warning": True}
+
+    mocker.patch(
+        "websites.management.commands.markdown_cleaning.rules.link_to_external_resource.get_or_build_external_resource",
+        return_value=mock_resource,
+    )
+
+    rule = LinkToExternalResourceRule()
+    rule.set_options({"commit": True})
+
+    mock_starter = mocker.Mock()
+    mock_starter.slug = settings.OCW_COURSE_STARTER_SLUG
+    rule.starter_lookup.get_starter = mocker.Mock(return_value=mock_starter)
+
+    mock_toks = mocker.Mock()
+    mock_toks.link.destination = "https://example.com"
+    mock_toks.link.text = "Example Link"
+    mock_toks.link.is_image = False
+    mock_toks.original_text = "[Example Link](https://example.com)"
+
+    # Call replace_match
+    rule.replace_match("", 0, mock_toks, website_content)
+
+    # Verify save was called
+    mock_resource.save.assert_called_once()
+    mock_resource.referencing_content.add.assert_called_once_with(website_content)
+
+
+def test_navitem_to_external_resource_no_save_when_commit_false(mocker):
+    """Test that external resource is not saved when commit is False."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    mock_resource = mocker.Mock(spec=WebsiteContent)
+    mock_resource.text_id = "f3d0ebae-7083-4524-9b93-f688537a0317"  # Valid UUID
+    mock_resource.metadata = {"has_external_license_warning": True}
+
+    mocker.patch(
+        "websites.management.commands.markdown_cleaning.rules.link_to_external_resource.build_external_resource",
+        return_value=mock_resource,
+    )
+
+    rule = NavItemToExternalResourceRule()
+    rule.set_options({"commit": False})
+
+    nav_item = {
+        "name": "Example Nav Item",
+        "url": "https://example.com",
+        "identifier": "external--123456789",
+        "weight": 10,
+    }
+
+    # Call generate_item_replacement
+    rule.generate_item_replacement(website_content, nav_item)
+
+    # Verify save was not called
+    mock_resource.save.assert_not_called()
+    mock_resource.referencing_content.add.assert_not_called()
+
+
+def test_navitem_to_external_resource_no_save_when_commit_true(mocker):
+    """Test that external resource is saved when commit is True."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    mock_resource = mocker.Mock(spec=WebsiteContent)
+    mock_resource.text_id = "f3d0ebae-7083-4524-9b93-f688537a0317"  # Valid UUID
+    mock_resource.metadata = {"has_external_license_warning": True}
+
+    mocker.patch(
+        "websites.management.commands.markdown_cleaning.rules.link_to_external_resource.build_external_resource",
+        return_value=mock_resource,
+    )
+
+    rule = NavItemToExternalResourceRule()
+    rule.set_options({"commit": True})
+
+    nav_item = {
+        "name": "Example Nav Item",
+        "url": "https://example.com",
+        "identifier": "external--123456789",
+        "weight": 10,
+    }
+
+    # Call generate_item_replacement
+    rule.generate_item_replacement(website_content, nav_item)
+
+    # Verify save was called
+    mock_resource.save.assert_called_once()
+    mock_resource.referencing_content.add.assert_called_once_with(website_content)
+
+
+def test_navitem_transform_text_handles_internal_references_commit_true(mocker):
+    """Test that transform_text properly handles internal nav item references when commit=True."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    # Create actual referenced content objects
+    WebsiteContentFactory.create(
+        website=website,
+        text_id="f3d0ebae-7083-4524-9b93-f688537a0317",
+        title="Referenced Page 1",
+    )
+    WebsiteContentFactory.create(
+        website=website,
+        text_id="a1b2c3d4-5678-9012-3456-789012345678",
+        title="Referenced Page 2",
+    )
+
+    rule = NavItemToExternalResourceRule()
+    rule.set_options({"commit": True})
+
+    # Test data with only internal references (no external links)
+    nav_items = [
+        {
+            "name": "Internal Reference 1",
+            "identifier": "f3d0ebae-7083-4524-9b93-f688537a0317",
+            "weight": 20,
+        },
+        {
+            "name": "Internal Reference 2",
+            "identifier": "a1b2c3d4-5678-9012-3456-789012345678",
+            "weight": 30,
+        },
+        {
+            "name": "No Identifier",
+            "weight": 40,
+        },
+    ]
+
+    # Mock on_match callback
+    mock_on_match = mocker.Mock()
+
+    # Call transform_text
+    result = rule.transform_text(website_content, nav_items, mock_on_match)
+
+    # Verify the result structure - nav items should be unchanged
+    assert isinstance(result, list)
+    assert len(result) == 3
+    # Cast to dict for type checking
+    result_items = [item for item in result if isinstance(item, dict)]
+    assert len(result_items) == 3
+    assert result_items[0].get("identifier") == "f3d0ebae-7083-4524-9b93-f688537a0317"
+    assert result_items[1].get("identifier") == "a1b2c3d4-5678-9012-3456-789012345678"
+    assert "identifier" not in result_items[2]
+
+
+def test_navitem_transform_text_handles_internal_references_commit_false(mocker):
+    """Test that transform_text does not set references when commit=False."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    rule = NavItemToExternalResourceRule()
+    rule.set_options({"commit": False})
+
+    # Test data with internal references
+    nav_items = [
+        {
+            "name": "Internal Reference 1",
+            "identifier": "f3d0ebae-7083-4524-9b93-f688537a0317",
+            "weight": 20,
+        },
+        {
+            "name": "Internal Reference 2",
+            "identifier": "a1b2c3d4-5678-9012-3456-789012345678",
+            "weight": 30,
+        },
+    ]
+
+    # Mock on_match callback
+    mock_on_match = mocker.Mock()
+
+    # Call transform_text
+    result = rule.transform_text(website_content, nav_items, mock_on_match)
+
+    # Verify the nav items are returned unchanged
+    assert result == nav_items
+
+
+def test_navitem_transform_text_mixed_external_and_internal_references(mocker):
+    """Test transform_text with mix of external links and internal references."""
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    website_content = WebsiteContentFactory.create(website=website)
+
+    # Create actual referenced content
+    WebsiteContentFactory.create(
+        website=website,
+        text_id="f3d0ebae-7083-4524-9b93-f688537a0317",
+        title="Referenced Page",
+    )
+
+    rule = NavItemToExternalResourceRule()
+    rule.set_options({"commit": True})
+
+    # Test data with mix of external and internal
+    nav_items = [
+        {
+            "name": "External Link",
+            "url": "https://example.com",
+            "identifier": "external--123456789",
+            "weight": 10,
+        },
+        {
+            "name": "Internal Reference",
+            "identifier": "f3d0ebae-7083-4524-9b93-f688537a0317",
+            "weight": 20,
+        },
+    ]
+
+    # Mock the external resource creation
+    mock_external_resource = mocker.Mock(spec=WebsiteContent)
+    mock_external_resource.text_id = "b2c3d4e5-6789-0123-4567-890123456789"
+    mock_external_resource.metadata = {"has_external_license_warning": True}
+
+    mocker.patch.object(
+        rule,
+        "generate_item_replacement",
+        return_value=(
+            {
+                "name": "External Link",
+                "identifier": "b2c3d4e5-6789-0123-4567-890123456789",
+                "weight": 10,
+            },
+            mock_external_resource,
+        ),
+    )
+
+    # Mock on_match callback
+    mock_on_match = mocker.Mock()
+
+    result = rule.transform_text(website_content, nav_items, mock_on_match)
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+
+    result_items = [item for item in result if isinstance(item, dict)]
+    assert len(result_items) == 2
+
+    # First item should be the transformed external link
+    assert result_items[0].get("identifier") == "b2c3d4e5-6789-0123-4567-890123456789"
+    # Second item should be unchanged internal reference
+    assert result_items[1].get("identifier") == "f3d0ebae-7083-4524-9b93-f688537a0317"
+
+
+def test_navitem_internal_references_functionality():
+    """Test that internal nav item references properly set the referenced_by relationship."""
+    with patch(
+        "external_resources.signals.submit_url_to_wayback_task.delay", return_value=None
+    ):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+
+        main_content = WebsiteContentFactory.create(website=website)
+
+        referenced_content_1 = WebsiteContentFactory.create(
+            website=website,
+            text_id="f3d0ebae-7083-4524-9b93-f688537a0317",
+            title="Referenced Page 1",
+        )
+        referenced_content_2 = WebsiteContentFactory.create(
+            website=website,
+            text_id="a1b2c3d4-5678-9012-3456-789012345678",
+            title="Referenced Page 2",
+        )
+
+        # Create nav items that reference these content objects
+        nav_items = [
+            {
+                "name": "Link to Page 1",
+                "identifier": "f3d0ebae-7083-4524-9b93-f688537a0317",
+                "weight": 10,
+            },
+            {
+                "name": "Link to Page 2",
+                "identifier": "a1b2c3d4-5678-9012-3456-789012345678",
+                "weight": 20,
+            },
+            {
+                "name": "External Link",
+                "url": "https://example.com",
+                "identifier": "external--123456789",
+                "weight": 30,
+            },
+        ]
+
+        # Set the nav items on the main content
+        main_content.metadata = {"leftnav": nav_items}
+        main_content.save()
+
+        # Use the cleaner to process the nav items
+        cleaner = get_cleaner("nav_item")
+        cleaner.update_website_content(main_content)
+
+        # Refresh from database to get updated relationships
+        main_content.refresh_from_db()
+        referenced_content_1.refresh_from_db()
+        referenced_content_2.refresh_from_db()
+
+        # Verify that the referenced content objects now have main_content in their referencing_content
+        assert main_content in referenced_content_1.referencing_content.all()
+        assert main_content in referenced_content_2.referencing_content.all()
+
+        # Verify that an external resource was created for the external link
+        external_resources = WebsiteContent.objects.filter(
+            website=website, type=CONTENT_TYPE_EXTERNAL_RESOURCE
+        )
+        assert external_resources.count() == 1
+        external_resource = external_resources.first()
+        assert external_resource.metadata["external_url"] == "https://example.com"
+
+        # Verify that the external resource references the main content
+        assert main_content in external_resource.referencing_content.all()
+
+
+@pytest.mark.parametrize(
+    ("url", "has_external_license_warning", "expected_warning"),
+    [
+        # When parameter is True: force warning for all domains
+        ("https://ocw.mit.edu", True, True),
+        ("https://example.com", True, True),
+        # When parameter is False: force no warning for all domains
+        ("https://ocw.mit.edu", False, False),
+        ("https://example.com", False, False),
+        # When parameter is None: use default (False)
+        ("https://ocw.mit.edu", None, False),
+        ("https://example.com", None, False),
+    ],
+)
+@patch("django.conf.settings.SITEMAP_DOMAIN", "ocw.mit.edu")
+def test_build_external_resource_with_license_warning_override(
+    url, has_external_license_warning, expected_warning
+):
+    """Test build_external_resource respects has_external_license_warning override.
+
+    When has_external_license_warning=True, it forces the warning regardless of domain.
+    When has_external_license_warning=False, it forces no warning regardless of domain.
+    When has_external_license_warning=None, it defaults to False.
+    """
+    starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+    website = WebsiteFactory.create(starter=starter)
+    title = "Test Resource"
+
+    external_resource = build_external_resource(
+        website=website,
+        site_config=SiteConfig(SAMPLE_SITE_CONFIG),
+        title=title,
+        url=url,
+        has_external_license_warning=has_external_license_warning,
+    )
+
+    assert (
+        external_resource.metadata["has_external_license_warning"] == expected_warning
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "has_external_license_warning", "expected_warning"),
+    [
+        # When parameter is True: force warning for all domains
+        ("https://ocw.mit.edu", True, True),
+        ("https://example.com", True, True),
+        # When parameter is False: force no warning for all domains
+        ("https://ocw.mit.edu", False, False),
+        ("https://example.com", False, False),
+        # When parameter is None: use default (False)
+        ("https://ocw.mit.edu", None, False),
+        ("https://example.com", None, False),
+    ],
+)
+@patch("django.conf.settings.SITEMAP_DOMAIN", "ocw.mit.edu")
+def test_link_to_external_resource_rule_with_license_warning_override(
+    settings, url, has_external_license_warning, expected_warning
+):
+    """Test LinkToExternalResourceRule respects has_external_license_warning option.
+
+    When True, forces warning regardless of domain.
+    When False, forces no warning regardless of domain.
+    When None, it defaults to False.
+    """
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Extract domain name for link text
+        content = f"[{urlparse(url).netloc}]({url})"
+        target_content = WebsiteContentFactory.create(
+            markdown=content,
+            website=website,
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options(
+            {
+                "commit": True,
+                "has_external_license_warning": has_external_license_warning,
+            }
+        )
+        cleaner = Cleaner(rule)
+        cleaner.update_website_content(target_content)
+
+        external_resource = WebsiteContent.objects.get(
+            website=website,
+            type=CONTENT_TYPE_EXTERNAL_RESOURCE,
+            metadata__external_url=url,
+        )
+
+        assert (
+            external_resource.metadata["has_external_license_warning"]
+            == expected_warning
+        )
+
+
+@pytest.mark.parametrize(
+    ("url", "has_external_license_warning", "expected_warning"),
+    [
+        # When parameter is True: force warning for all domains
+        ("https://ocw.mit.edu", True, True),
+        ("https://example.com", True, True),
+        # When parameter is False: force no warning for all domains
+        ("https://ocw.mit.edu", False, False),
+        ("https://example.com", False, False),
+        # When parameter is None: use default (False)
+        ("https://ocw.mit.edu", None, False),
+        ("https://example.com", None, False),
+    ],
+)
+@patch("django.conf.settings.SITEMAP_DOMAIN", "ocw.mit.edu")
+def test_nav_item_to_external_resource_rule_with_license_warning_override(
+    url, has_external_license_warning, expected_warning
+):
+    """Test NavItemToExternalResourceRule respects has_external_license_warning option.
+
+    When True, forces warning regardless of domain.
+    When False, forces no warning regardless of domain.
+    When None, it defaults to False.
+    """
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+
+        # Extract domain name for nav item name
+        nav_items = [
+            {
+                "name": urlparse(url).netloc,
+                "url": url,
+                "weight": 10,
+                "identifier": "external--test-id",
+            }
+        ]
+
+        target_content = WebsiteContentFactory.create(
+            website=website,
+            metadata={"leftnav": nav_items},
+        )
+
+        rule = NavItemToExternalResourceRule()
+        rule.set_options(
+            {
+                "commit": True,
+                "has_external_license_warning": has_external_license_warning,
+            }
+        )
+        cleaner = Cleaner(rule)
+        cleaner.update_website_content(target_content)
+
+        external_resource = WebsiteContent.objects.get(
+            website=website,
+            type=CONTENT_TYPE_EXTERNAL_RESOURCE,
+            metadata__external_url=url,
+        )
+
+        assert (
+            external_resource.metadata["has_external_license_warning"]
+            == expected_warning
+        )
+
+
+@pytest.mark.django_db
+def test_link_to_external_resource_converts_shortcode_attributes_with_escaped_quotes(
+    settings,
+):
+    """Test that links inside Hugo shortcode attributes are converted with proper quote escaping."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(
+            config=SAMPLE_SITE_CONFIG,
+        )
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Test case: link inside shortcode attribute should be converted with escaped quotes
+        markdown_with_shortcode_link = """
+            {{< image-gallery >}}
+            {{< image-gallery-item href="test1.png" text="Botryoidal and massive hematite: Fe{{< sub 2 >}}O{{< sub 3 >}}." >}}
+            {{< image-gallery-item href="test1.png" data-ngdesc="An end view diagram of the Beaver press with various parts identified." text="[OCW](https://ocw.mit.edu) - The screw to which the bar of the press is affixed, and which produces the pressure on the platen." >}}
+            {{< /image-gallery >}}
+        """
+
+        # Test case: regular link should be converted
+        markdown_with_regular_link = (
+            "Here is a [regular link](https://example.com) that should be converted."
+        )
+
+        # Test case: mixed content - regular links converted, shortcode links converted with escaping
+        markdown_mixed = f"""
+            Here is a [normal link](https://example.com).
+            {markdown_with_shortcode_link}
+            And another [normal link](https://example2.com) here.
+        """
+
+        website_content_shortcode = WebsiteContentFactory.create(
+            website=website, markdown=markdown_with_shortcode_link, type="page"
+        )
+
+        website_content_regular = WebsiteContentFactory.create(
+            website=website, markdown=markdown_with_regular_link, type="page"
+        )
+
+        website_content_mixed = WebsiteContentFactory.create(
+            website=website, markdown=markdown_mixed, type="page"
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        # Test 1: Shortcode attribute link SHOULD be converted with escaped quotes
+        original_shortcode_content = website_content_shortcode.markdown
+        updated_shortcode = cleaner.update_website_content(website_content_shortcode)
+
+        assert updated_shortcode is True
+        # The content should have been changed (link converted to resource_link with escaped quotes)
+        assert website_content_shortcode.markdown != original_shortcode_content
+        assert "[OCW](https://ocw.mit.edu)" not in website_content_shortcode.markdown
+        assert "resource_link" in website_content_shortcode.markdown
+        # Check that quotes are properly escaped inside the shortcode attribute
+        assert (
+            '\\"' in website_content_shortcode.markdown
+        )  # Escaped quotes should be present
+        # The pattern should look like: text="{{% resource_link \"uuid\" \"OCW\" %}}"
+        assert 'resource_link \\"' in website_content_shortcode.markdown
+        # The pattern should look like: text="{{% resource_link \"uuid\" \"OCW\" %}}"
+        assert 'resource_link \\"' in website_content_shortcode.markdown
+
+        # Test 2: Regular link should be converted (no change in behavior)
+        updated_regular = cleaner.update_website_content(website_content_regular)
+        assert updated_regular is True
+        assert "resource_link" in website_content_regular.markdown
+        assert (
+            "[regular link](https://example.com)"
+            not in website_content_regular.markdown
+        )
+
+        # Test 3: Mixed content - all links converted (regular links normally, shortcode links with escaping)
+        updated_mixed = cleaner.update_website_content(website_content_mixed)
+        assert updated_mixed is True
+        # Regular links should be converted normally
+        assert (
+            "[normal link](https://example.com)" not in website_content_mixed.markdown
+        )
+        assert (
+            "[normal link](https://example2.com)" not in website_content_mixed.markdown
+        )
+        assert "resource_link" in website_content_mixed.markdown
+        # Shortcode attribute link should be converted with escaped quotes
+        assert "[OCW](https://ocw.mit.edu)" not in website_content_mixed.markdown
+        assert 'resource_link \\"' in website_content_mixed.markdown
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "should_have_escaped_quotes", "description"),
+    [
+        # Link after closed shortcode should be converted normally
+        (
+            "Before {{< shortcode >}} and [link](https://example.com) after",
+            False,
+            "after closed shortcode",
+        ),
+        # Link inside single-line shortcode attribute should be converted with escaped quotes
+        (
+            '{{< image-gallery-item text="[link](https://example.com)" >}}',
+            True,
+            "single-line shortcode attribute",
+        ),
+        # Link with multiple attributes should be converted with escaped quotes
+        (
+            '{{< image-gallery-item text="Some [link](https://example.com) text" attr="value" >}}',
+            True,
+            "multiple attributes",
+        ),
+        # Multiple links inside same shortcode attribute should be converted with escaped quotes
+        (
+            '{{< image-gallery-item text="Check [link1](https://example.com) and [link2](https://google.com) both" >}}',
+            True,
+            "multiple links in single attribute",
+        ),
+        # Link outside any shortcode should be converted normally
+        (
+            "Regular [link](https://example.com) in text",
+            False,
+            "outside shortcode",
+        ),
+    ],
+)
+@pytest.mark.django_db
+def test_shortcode_attribute_detection_edge_cases(
+    settings, markdown_text, should_have_escaped_quotes, description
+):
+    """Test edge cases for shortcode attribute detection and quote escaping."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(
+            config=SAMPLE_SITE_CONFIG,
+        )
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        website_content = WebsiteContentFactory.create(
+            website=website, markdown=markdown_text, type="page"
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        updated = cleaner.update_website_content(website_content)
+
+        assert updated is True, f"Failed: {description} - should have been converted"
+        assert "resource_link" in website_content.markdown, (
+            f"Failed: {description} - no resource_link found"
+        )
+        # Check that original markdown links are no longer present
+        assert "](https://" not in website_content.markdown, (
+            f"Failed: {description} - original links still present"
+        )
+
+        # Check quote escaping based on context
+        if should_have_escaped_quotes:
+            assert '\\"' in website_content.markdown, (
+                f"Failed: {description} - should have escaped quotes inside shortcode attribute"
+            )
+            assert 'resource_link \\"' in website_content.markdown, (
+                f"Failed: {description} - resource_link should have escaped quotes"
+            )
+        else:
+            # For links outside shortcode attributes, quotes should not be escaped
+            # (they use normal Hugo shortcode syntax with regular quotes)
+            assert 'resource_link "' in website_content.markdown, (
+                f"Failed: {description} - should have normal quotes outside shortcode"
+            )
+
+
+@pytest.mark.django_db
+def test_nested_shortcode_quote_escaping_comprehensive(settings):
+    """Test comprehensive scenarios for nested shortcode quote escaping."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Test various nested shortcode scenarios
+        test_cases = [
+            {
+                "name": "image-gallery with multiple attributes",
+                "input": """{{< image-gallery id="gallery1" >}}
+{{< image-gallery-item href="image1.jpg" data-ngdesc="This is a [markdown link](https://example.com) within shortcode" text="Description with [another link](https://example.org) text" >}}
+{{< image-gallery-item href="image2.jpg" data-ngdesc="Multiple [link one](https://first.com) and [link two](https://second.com) in same text" >}}
+{{< /image-gallery >}}""",
+                "expected_patterns": [
+                    'resource_link \\"',  # Escaped quotes
+                    'data-ngdesc="This is a {{% resource_link',  # Proper nesting
+                    'text="Description with {{% resource_link',  # Multiple attributes
+                ],
+            },
+            {
+                "name": "single attribute with quotes in link text",
+                "input": '{{< shortcode text="Here is [Spindle](https://example.com/spindle) text" >}}',
+                "expected_patterns": [
+                    'resource_link \\"',  # Escaped quotes
+                    'text="Here is {{% resource_link',  # Proper conversion
+                ],
+            },
+            {
+                "name": "mixed content with regular and nested links",
+                "input": """Regular [link](https://regular.com) here.
+{{< shortcode attr="Nested [link](https://nested.com) here" >}}
+Another regular [link](https://another.com).""",
+                "expected_patterns": [
+                    'resource_link "',  # Regular quotes for normal links
+                    'resource_link \\"',  # Escaped quotes for nested links
+                ],
+            },
+        ]
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        for test_case in test_cases:
+            website_content = WebsiteContentFactory.create(
+                website=website,
+                markdown=test_case["input"],
+                type="page",
+                title=f"Test {test_case['name']}",
+            )
+
+            updated = cleaner.update_website_content(website_content)
+
+            assert updated is True, f"Failed to update: {test_case['name']}"
+
+            # Check that all links were converted
+            assert "](https://" not in website_content.markdown, (
+                f"Original links still present in: {test_case['name']}"
+            )
+            assert "resource_link" in website_content.markdown, (
+                f"No resource_link found in: {test_case['name']}"
+            )
+
+            # Check expected patterns
+            for pattern in test_case["expected_patterns"]:
+                assert pattern in website_content.markdown, (
+                    f"Pattern '{pattern}' not found in {test_case['name']}.\n"
+                    f"Content: {website_content.markdown[:200]}..."
+                )
+
+
+def test_link_to_external_resource_fixes_incorrect_title_escaping(settings):
+    r"""
+    Test that link conversion properly unescapes backticks and square brackets
+    in the title when converting from markdown to shortcode.
+
+    In markdown: [\`\[T\]his...]() needs escaping for proper parsing
+    In shortcode: "`[T]his..." should NOT be escaped in the title argument
+    """
+    # Then test the problematic markdown
+    escaped_markdown = r"[\`\[T\]his title is problematic](http://example.com)"
+
+    with patch(
+        "external_resources.signals.submit_url_to_wayback_task.delay", return_value=None
+    ):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        escaped_content = WebsiteContentFactory.create(
+            markdown=escaped_markdown,
+            website=website,
+        )
+
+        cleaner = get_cleaner("markdown")
+        cleaner.update_website_content(escaped_content)
+
+        assert "resource_link" in escaped_content.markdown
+
+        # The title in the shortcode should have unescaped characters
+        assert "`[T]his title is problematic" in escaped_content.markdown
+        assert r"\`\[T\]his title is problematic" not in escaped_content.markdown
+
+
+def test_navitem_to_external_resource_fixes_incorrect_title_escaping():
+    r"""
+    Test that NavItemToExternalResourceRule properly unescapes backticks and square brackets
+    in navigation item names when converting to external resources.
+
+    In nav item: name: [\`\[T\]his...]() needs escaping for proper parsing
+    In external resource: title should be "`[T]his..." (unescaped)
+    """
+    with patch(
+        "external_resources.signals.submit_url_to_wayback_task.delay", return_value=None
+    ):
+        starter = WebsiteStarterFactory.create(config=SAMPLE_SITE_CONFIG)
+        website = WebsiteFactory.create(starter=starter)
+
+        # Test data with escaped characters in nav item names
+        nav_items_with_escaped_chars = [
+            {
+                "name": r"\`\[T\]his is a problematic nav item",
+                "url": "https://example.com/nav1",
+                "weight": 10,
+                "identifier": "external--123456789",
+            },
+            {
+                "name": r"Another \`escaped\` example",
+                "url": "https://example.com/nav2",
+                "weight": 20,
+                "identifier": "external--987654321",
+            },
+            {
+                "name": r"\[Bracket only\] example",
+                "url": "https://example.com/nav3",
+                "weight": 30,
+                "identifier": "external--555666777",
+            },
+        ]
+
+        target_content = WebsiteContentFactory.create(
+            website=website,
+            type=CONTENT_TYPE_NAVMENU,
+            metadata={"leftnav": nav_items_with_escaped_chars},
+        )
+
+        cleaner = get_cleaner("nav_item")
+        cleaner.update_website_content(target_content)
+
+        # Get all external resource content created by the rule
+        external_resources = WebsiteContent.objects.filter(
+            website=website, type=CONTENT_TYPE_EXTERNAL_RESOURCE
+        ).order_by("title")
+
+        assert external_resources.count() == 3
+
+        # Check that external resource titles have unescaped characters
+        resource_titles = [resource.title for resource in external_resources]
+
+        # Verify unescaping happened correctly
+        assert "`[T]his is a problematic nav item" in resource_titles
+        assert "Another `escaped` example" in resource_titles
+        assert "[Bracket only] example" in resource_titles
+
+        # Verify escaped versions are NOT in the titles
+        assert r"\`\[T\]his is a problematic nav item" not in resource_titles
+        assert r"Another \`escaped\` example" not in resource_titles
+        assert r"\[Bracket only\] example" not in resource_titles
+
+        # Verify that nav items now reference the external resources correctly
+        updated_nav = target_content.metadata["leftnav"]
+        assert len(updated_nav) == 3
+
+        # Each nav item should have its identifier updated and url removed
+        for item in updated_nav:
+            assert "url" not in item
+            assert "identifier" in item
+            # The identifier should be a valid UUID (external resource text_id)
+            assert len(item["identifier"]) == 36  # UUID length
+
+
+def test_unescape_link_text():
+    """Test the unescape_link_text helper function."""
+    test_cases = [
+        (r"\`\[T\]his", "`[T]his"),
+        (r"Mixed \`code\` and \[bracket\]", "Mixed `code` and [bracket]"),
+        ("Already clean", "Already clean"),
+        ("", ""),
+    ]
+    for raw, expected in test_cases:
+        assert unescape_link_text(raw) == expected
+        assert unescape_link_text(unescape_link_text(raw)) == expected
+
+
+@pytest.mark.django_db
+def test_link_to_external_resource_converts_embedded_shortcodes_to_html(settings):
+    """Test that links with embedded shortcodes in the title convert them to HTML."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(
+            config=SAMPLE_SITE_CONFIG,
+        )
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Test case: link title contains embedded shortcodes (like APA Style with registered trademark)
+        markdown_with_embedded_shortcode = (
+            '[APA Style{{< sup "{{< sub \\"®\\" >}}" >}}](http://www.apastyle.org/)'
+        )
+
+        website_content = WebsiteContentFactory.create(
+            website=website, markdown=markdown_with_embedded_shortcode, type="page"
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        # Convert the markdown link to resource_link shortcode
+        updated = cleaner.update_website_content(website_content)
+
+        assert updated is True
+        # The original markdown link should be replaced
+        assert (
+            '[APA Style{{< sup "{{< sub \\"®\\" >}}" >}}](http://www.apastyle.org/)'
+            not in website_content.markdown
+        )
+        # The result should contain a resource_link shortcode
+        assert "resource_link" in website_content.markdown
+
+        # Critical: The embedded shortcodes should be converted to HTML equivalents
+        # Hugo expects: {{% resource_link "uuid" "APA Style<sup><sub>®</sub></sup>" %}}
+        # This allows proper rendering within the shortcode parameter
+
+        # Check that shortcodes were converted to HTML tags
+        assert "<sup>" in website_content.markdown
+        assert "</sup>" in website_content.markdown
+        assert "<sub>" in website_content.markdown
+        assert "</sub>" in website_content.markdown
+
+        # Verify that the HTML structure is intact
+        # The pattern should be: "APA Style<sup><sub>®</sub></sup>"
+        assert "<sup><sub>®</sub></sup>" in website_content.markdown
+
+        # Make sure original shortcode syntax was removed
+        assert "{{< sup" not in website_content.markdown
+        assert "{{< sub" not in website_content.markdown
+
+
+def test_link_to_external_resource_converts_malformed_escaped_shortcodes(settings):
+    """Test that malformed shortcodes with escaped backslashes are handled correctly."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(
+            config=SAMPLE_SITE_CONFIG,
+        )
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Test case: malformed shortcode with escaped backslash: {{\< instead of {{<
+        # This is a data quality issue found in some legacy content
+        markdown_with_malformed_shortcode = (
+            r'[The MathWorks{{\< sup "®" >}}](http://in.mathworks.com/)'
+        )
+
+        website_content = WebsiteContentFactory.create(
+            website=website, markdown=markdown_with_malformed_shortcode, type="page"
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        # Convert the markdown link to resource_link shortcode
+        updated = cleaner.update_website_content(website_content)
+
+        assert updated is True
+        # The original markdown link should be replaced
+        assert r'{{\< sup "®" >}}' not in website_content.markdown
+        # The result should contain a resource_link shortcode
+        assert "resource_link" in website_content.markdown
+
+        # Critical: Even malformed shortcodes should be normalized and converted to HTML
+        # The normalization step converts {{\< to {{< before processing
+        assert "<sup>" in website_content.markdown
+        assert "</sup>" in website_content.markdown
+
+        # Verify the HTML is properly formed
+        assert "<sup>®</sup>" in website_content.markdown
+
+        # Make sure no shortcode syntax remains (including malformed)
+        assert "{{< sup" not in website_content.markdown
+        assert r"{{\<" not in website_content.markdown
+
+
+def test_link_to_external_resource_converts_malformed_escaped_closing_syntax(
+    settings,
+):
+    """Test that malformed shortcodes with escaped backslash in closing syntax are handled."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(
+            config=SAMPLE_SITE_CONFIG,
+        )
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Test case: malformed shortcode with escaped backslash in closing: \>}} instead of >}}
+        markdown_with_malformed_closing = (
+            r'[The MathWorks{{< sup "®" \>}}](http://in.mathworks.com/)'
+        )
+
+        website_content = WebsiteContentFactory.create(
+            website=website, markdown=markdown_with_malformed_closing, type="page"
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        # Convert the markdown link to resource_link shortcode
+        updated = cleaner.update_website_content(website_content)
+
+        assert updated is True
+        # The original markdown link should be replaced
+        assert r'{{< sup "®" \>}}' not in website_content.markdown
+        # The result should contain a resource_link shortcode
+        assert "resource_link" in website_content.markdown
+
+        # Critical: Even malformed closing syntax should be normalized and converted to HTML
+        # The normalization step converts \>}} to >}} before processing
+        assert "<sup>" in website_content.markdown
+        assert "</sup>" in website_content.markdown
+
+        # Verify the HTML is properly formed
+        assert "<sup>®</sup>" in website_content.markdown
+
+        # Make sure no malformed syntax remains
+        assert "{{< sup" not in website_content.markdown
+        assert r"\>}}" not in website_content.markdown
+
+
+def test_link_to_external_resource_converts_fully_malformed_shortcodes(settings):
+    """Test that shortcodes with both opening and closing escaped backslashes are handled."""
+    with patch("external_resources.signals.submit_url_to_wayback_task.delay"):
+        starter = WebsiteStarterFactory.create(
+            config=SAMPLE_SITE_CONFIG,
+        )
+        website = WebsiteFactory.create(starter=starter)
+        settings.OCW_COURSE_STARTER_SLUG = starter.slug
+
+        # Test case: both opening and closing have escaped backslashes
+        markdown_fully_malformed = (
+            r'[The MathWorks{{\< sup "®" \>}}](http://in.mathworks.com/)'
+        )
+
+        website_content = WebsiteContentFactory.create(
+            website=website, markdown=markdown_fully_malformed, type="page"
+        )
+
+        rule = LinkToExternalResourceRule()
+        rule.set_options({"commit": True})
+        cleaner = Cleaner(rule)
+
+        # Convert the markdown link to resource_link shortcode
+        updated = cleaner.update_website_content(website_content)
+
+        assert updated is True
+        # The original markdown link should be replaced
+        assert r'{{\< sup "®" \>}}' not in website_content.markdown
+        # The result should contain a resource_link shortcode
+        assert "resource_link" in website_content.markdown
+
+        # Critical: Both opening and closing malformed syntax should be normalized and converted
+        assert "<sup>" in website_content.markdown
+        assert "</sup>" in website_content.markdown
+
+        # Verify the HTML is properly formed
+        assert "<sup>®</sup>" in website_content.markdown
+
+        # Make sure no malformed syntax remains (neither opening nor closing)
+        assert "{{< sup" not in website_content.markdown
+        assert r"{{\<" not in website_content.markdown
+        assert r"\>}}" not in website_content.markdown

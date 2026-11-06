@@ -1,0 +1,7 @@
+.tox
+.cache
+htmlcov
+.coverage
+node_modules
+staticfiles/
+s3/

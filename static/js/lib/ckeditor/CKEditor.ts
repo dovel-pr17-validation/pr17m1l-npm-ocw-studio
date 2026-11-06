@@ -1,0 +1,300 @@
+import EssentialsPlugin from "@ckeditor/ckeditor5-essentials/src/essentials"
+import AutoformatPlugin from "@ckeditor/ckeditor5-autoformat/src/autoformat"
+import BoldPlugin from "@ckeditor/ckeditor5-basic-styles/src/bold"
+import SubscriptPlugin from "@ckeditor/ckeditor5-basic-styles/src/subscript"
+import SuperscriptPlugin from "@ckeditor/ckeditor5-basic-styles/src/superscript"
+import ItalicPlugin from "@ckeditor/ckeditor5-basic-styles/src/italic"
+import BlockQuotePlugin from "@ckeditor/ckeditor5-block-quote/src/blockquote"
+import HeadingPlugin from "@ckeditor/ckeditor5-heading/src/heading"
+import ImagePlugin from "@ckeditor/ckeditor5-image/src/image"
+import ImageCaptionPlugin from "@ckeditor/ckeditor5-image/src/imagecaption"
+import ImageStylePlugin from "@ckeditor/ckeditor5-image/src/imagestyle"
+import ImageToolbarPlugin from "@ckeditor/ckeditor5-image/src/imagetoolbar"
+import LinkPlugin from "@ckeditor/ckeditor5-link/src/link"
+/**
+ * Deliberately `legacylist`, not `list`. CKEditor v41 replaced the contents of
+ * `src/list` with the document list implementation and moved the original to
+ * `src/legacylist`, so the old import path silently changes the editing model
+ * from `listItem` elements to paragraphs carrying `listItemId`/`listIndent`.
+ * This import pins the behaviour Studio has always had.
+ *
+ * `LegacyList` is removed in CKEditor 45, so upgrading past 43 requires
+ * migrating to the document list and re-checking how nested lists and list
+ * items containing block content round-trip through Markdown.
+ */
+import ListPlugin from "@ckeditor/ckeditor5-list/src/legacylist"
+import ParagraphPlugin from "@ckeditor/ckeditor5-paragraph/src/paragraph"
+import TablePlugin from "@ckeditor/ckeditor5-table/src/table"
+import TableToolbarPlugin from "@ckeditor/ckeditor5-table/src/tabletoolbar"
+import CodeBlockPlugin from "@ckeditor/ckeditor5-code-block/src/codeblock"
+import CodePlugin from "@ckeditor/ckeditor5-basic-styles/src/code"
+import Mathematics from "@isaul32/ckeditor5-math/src/math"
+import MathSyntax from "./plugins/MathSyntax"
+
+import Markdown from "./plugins/Markdown"
+import ResourceEmbed from "./plugins/ResourceEmbed"
+import ResourcePicker from "./plugins/ResourcePicker"
+import {
+  ADD_IMAGE_GALLERY,
+  ADD_RESOURCE_EMBED,
+  ADD_RESOURCE_LINK,
+} from "./plugins/constants"
+import ResourceLink from "./plugins/ResourceLink"
+import DisallowNestedTables from "./plugins/DisallowNestedTables"
+import TableMarkdownSyntax from "./plugins/TableMarkdownSyntax"
+import MarkdownListSyntax from "./plugins/MarkdownListSyntax"
+import LegacyShortcodes from "./plugins/LegacyShortcodes"
+import ImageGallery from "./plugins/ImageGallery"
+
+/**
+ * Programming languages we support in CKEditor code blocks
+ *
+ * This list is based on CKEditor's default list, here:
+ *
+ * https://github.com/ckeditor/ckeditor5/blob/master/packages/ckeditor5-code-block/src/codeblockediting.js#L60
+ *
+ * extended with a few more options.
+ */
+const SUPPORTED_PROGRAMMING_LANGUAGES = [
+  { language: "plaintext", label: "Plain text" },
+  { language: "c", label: "C" },
+  { language: "cs", label: "C#" },
+  { language: "cpp", label: "C++" },
+  { language: "css", label: "CSS" },
+  { language: "diff", label: "Diff" },
+  { language: "html", label: "HTML" },
+  { language: "java", label: "Java" },
+  { language: "javascript", label: "JavaScript" },
+  { language: "julia", label: "Julia" },
+  { language: "matlab", label: "Matlab" },
+  { language: "php", label: "PHP" },
+  { language: "python", label: "Python" },
+  { language: "ruby", label: "Ruby" },
+  { language: "typescript", label: "TypeScript" },
+  { language: "xml", label: "XML" },
+]
+
+export const FullEditorConfig = {
+  plugins: [
+    EssentialsPlugin,
+    AutoformatPlugin,
+    BoldPlugin,
+    ItalicPlugin,
+    // note that this is just for inline (not block-level) code
+    CodePlugin,
+    BlockQuotePlugin,
+    HeadingPlugin,
+    ImagePlugin,
+    ImageCaptionPlugin,
+    ImageStylePlugin,
+    ImageToolbarPlugin,
+    LinkPlugin,
+    ListPlugin,
+    ParagraphPlugin,
+    TablePlugin,
+    TableToolbarPlugin,
+    CodeBlockPlugin,
+    /**
+     * Must stay above every other plugin that adds Markdown syntax (and so
+     * above `Markdown`). Showdown runs extensions in the order their plugins
+     * are constructed, and galleries keep their params exactly as authored:
+     * an extension that ran first could rewrite text inside a caption before
+     * the gallery captured it, as MathSyntax would turn `\\(…\\)` into HTML.
+     */
+    ImageGallery,
+    ResourceEmbed,
+    ResourcePicker,
+    ResourceLink,
+    SubscriptPlugin,
+    SuperscriptPlugin,
+    TableMarkdownSyntax,
+    MathSyntax, // Needs to go before MarkdownListSyntax
+    MarkdownListSyntax,
+    LegacyShortcodes,
+    Mathematics,
+    Markdown,
+    DisallowNestedTables,
+  ],
+  toolbar: {
+    items: [
+      "heading",
+      "|",
+      "bold",
+      "italic",
+      "subscript",
+      "superscript",
+      "link",
+      "bulletedList",
+      "numberedList",
+      "blockQuote",
+      "code",
+      "codeBlock",
+      "insertTable",
+      "math",
+      "undo",
+      "redo",
+      ADD_RESOURCE_LINK,
+      ADD_RESOURCE_EMBED,
+      ADD_IMAGE_GALLERY,
+    ],
+  },
+  image: {
+    // These style buttons only affect how the image looks inside the editor.
+    // Neither `block` nor `side` survives a save: our Markdown output for an
+    // image is `![alt](src)` either way, so nothing reaches Hugo. `block` is
+    // here only because it is the current name for the option this toolbar
+    // used to spell `full`, which stopped resolving to a button years ago.
+    toolbar: [
+      "imageStyle:block",
+      "imageStyle:side",
+      "|",
+      "imageTextAlternative",
+    ],
+  },
+  codeBlock: {
+    languages: SUPPORTED_PROGRAMMING_LANGUAGES,
+  },
+  table: {
+    contentToolbar: ["tableColumn", "tableRow", "mergeTableCells"],
+    defaultHeadings: { rows: 1 },
+  },
+  math: {
+    engine: "mathjax",
+    outputType: "script",
+    forceOutputType: true,
+    enablePreview: true,
+  },
+  language: "en",
+}
+
+export const MinimalEditorConfig = {
+  plugins: [
+    EssentialsPlugin,
+    AutoformatPlugin,
+    BoldPlugin,
+    ItalicPlugin,
+    CodePlugin,
+    BlockQuotePlugin,
+    LinkPlugin,
+    ListPlugin,
+    ParagraphPlugin,
+    ResourceEmbed,
+    ResourcePicker,
+    ResourceLink,
+    MarkdownListSyntax,
+    Markdown,
+    LegacyShortcodes,
+  ],
+  toolbar: {
+    items: [
+      "bold",
+      "italic",
+      "code",
+      "link",
+      "bulletedList",
+      "numberedList",
+      "blockQuote",
+      "undo",
+      "redo",
+      ADD_RESOURCE_LINK,
+      ADD_RESOURCE_EMBED,
+    ],
+  },
+  language: "en",
+}
+
+export const MinimalWithMathEditorConfig = {
+  plugins: [
+    EssentialsPlugin,
+    AutoformatPlugin,
+    BoldPlugin,
+    ItalicPlugin,
+    CodePlugin,
+    BlockQuotePlugin,
+    LinkPlugin,
+    ListPlugin,
+    ParagraphPlugin,
+    ResourceEmbed,
+    ResourcePicker,
+    ResourceLink,
+    MathSyntax,
+    MarkdownListSyntax,
+    Mathematics,
+    Markdown,
+    LegacyShortcodes,
+  ],
+  toolbar: {
+    items: [
+      "bold",
+      "italic",
+      "code",
+      "link",
+      "bulletedList",
+      "numberedList",
+      "blockQuote",
+      "math",
+      "undo",
+      "redo",
+      ADD_RESOURCE_LINK,
+      ADD_RESOURCE_EMBED,
+    ],
+  },
+  math: {
+    engine: "mathjax",
+    outputType: "script",
+    forceOutputType: true,
+    enablePreview: true,
+  },
+  language: "en",
+}
+
+export const MinimalWithSubSupEditorConfig = {
+  plugins: [
+    EssentialsPlugin,
+    AutoformatPlugin,
+    BoldPlugin,
+    ItalicPlugin,
+    CodePlugin,
+    BlockQuotePlugin,
+    LinkPlugin,
+    ListPlugin,
+    ParagraphPlugin,
+    ResourceEmbed,
+    ResourcePicker,
+    ResourceLink,
+    SubscriptPlugin,
+    SuperscriptPlugin,
+    MarkdownListSyntax,
+    /**
+     * Must stay above `Markdown`. Syntax plugins publish their showdown
+     * extension and turndown rules from their own constructor, and `Markdown`
+     * reads that config in its constructor to build the data processor, so a
+     * syntax plugin listed later contributes nothing: `{{< sub 2 >}}` is never
+     * upcast to a shortcode widget on load and turndown escapes the delimiter
+     * on save, leaving `{{\< sub 2 >}}` for Hugo to render literally.
+     *
+     * `MinimalEditorConfig` and `MinimalWithMathEditorConfig` still have these
+     * two the wrong way round; fixing those changes what existing fields save.
+     */
+    LegacyShortcodes,
+    Markdown,
+  ],
+  toolbar: {
+    items: [
+      "bold",
+      "italic",
+      "subscript",
+      "superscript",
+      "code",
+      "link",
+      "bulletedList",
+      "numberedList",
+      "blockQuote",
+      "undo",
+      "redo",
+      ADD_RESOURCE_LINK,
+      ADD_RESOURCE_EMBED,
+    ],
+  },
+  language: "en",
+}

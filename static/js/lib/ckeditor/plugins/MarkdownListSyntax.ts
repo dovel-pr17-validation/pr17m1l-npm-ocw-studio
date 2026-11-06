@@ -1,0 +1,56 @@
+import { ShowdownExtension } from "showdown"
+import { TurndownRule } from "../../../types/ckeditor_markdown"
+import MarkdownSyntaxPlugin from "./MarkdownSyntaxPlugin"
+
+const domParser = new DOMParser()
+
+/**
+ * This "extension" is addresses an incompatibility between
+ *  - the HTML that showdown produces for lists
+ *  - the HTML that CKEditor expects for lists
+ *
+ * When a markdown list item contains multiple lines, showdown puts <p> tags
+ * around all list items (and multiple <p> tags for the multi-line list item).
+ * See https://github.com/showdownjs/showdown/wiki/Showdown's-Markdown-syntax#known-differences-and-gotchas.
+ *
+ * CKEditor, on the other hand, forbids paragraphs inside list items. Both are
+ * "block" elements in its schema; see https://ckeditor.com/docs/ckeditor5/latest/framework/guides/deep-dive/schema.html#defining-additional-semantics
+ * and block elements cannot contain other block elements. (There is discussion
+ * of having a list variant that can contain block elements; see
+ * https://github.com/ckeditor/ckeditor5/issues/2973 for more.)
+ *
+ * So here we add a Showdown rule to replace list item paragraph tags with
+ * linebreaks, the same as CKEditor produces.
+ *
+ */
+export default class MarkdownListSyntax extends MarkdownSyntaxPlugin {
+  get showdownExtension(): () => ShowdownExtension[] {
+    return () => [
+      {
+        type: "output",
+        filter: (htmlString) => {
+          // Wrapped in <body> so the parser is already in "in body" insertion
+          // mode for the very first token: otherwise a leading comment, a
+          // head-context tag like <title>/<style>, or whitespace-only input
+          // gets consumed by earlier HTML5 parsing modes and never reaches
+          // doc.body at all.
+          const doc = domParser.parseFromString(
+            `<body>${htmlString}</body>`,
+            "text/html",
+          )
+
+          doc.body.querySelectorAll("li > p").forEach((node) => {
+            const suffix = node.nextSibling === null ? "" : " <br><br>"
+            node.outerHTML = `${node.innerHTML}${suffix}`
+          })
+
+          return doc.body.innerHTML
+        },
+      },
+    ]
+  }
+
+  get turndownRules(): TurndownRule[] {
+    return []
+  }
+}

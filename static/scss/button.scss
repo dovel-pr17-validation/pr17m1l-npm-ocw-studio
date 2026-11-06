@@ -1,0 +1,57 @@
+$standard-border-radius: 2px;
+
+.transparent-button {
+  background: initial;
+  border: none;
+}
+
+.cyan-button {
+  background-color: $studio-cyan;
+  color: $white;
+  font-weight: 500;
+}
+
+.cyan-button-outline {
+  border-color: $studio-cyan;
+  background-color: $white;
+  color: $black;
+}
+
+.cyan-button,
+.cyan-button-outline {
+  font-size: 16px;
+  padding: 6px 16px;
+  border-radius: $standard-border-radius;
+
+  &:hover {
+    background-color: $black;
+    color: $white;
+  }
+
+  &:active {
+    background-color: $studio-dark-gray;
+    color: $white;
+  }
+
+  &.larger {
+    font-size: 18px;
+    padding: 8px 30px;
+  }
+}
+
+.gray-button {
+  cursor: pointer;
+  color: $studio-gray;
+
+  &.hover {
+    &:hover {
+      color: $studio-black;
+    }
+  }
+}
+
+.pagination {
+  i {
+    font-size: 45px;
+  }
+}

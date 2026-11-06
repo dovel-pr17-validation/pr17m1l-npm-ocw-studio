@@ -1,0 +1,859 @@
+"""Video tasks"""
+
+import logging
+from urllib.parse import urljoin
+
+import celery
+import requests
+from django.conf import settings
+from django.db import transaction
+from django.db.models import Q
+from googleapiclient.errors import HttpError
+from mitol.common.utils import now_in_utc
+from mitol.mail.api import get_message_sender
+from rest_framework.status import HTTP_200_OK
+
+from content_sync.decorators import single_task
+from gdrive_sync.api import get_drive_service, query_files
+from gdrive_sync.constants import (
+    DRIVE_FILE_CREATED_TIME,
+    DRIVE_FILE_DOWNLOAD_LINK,
+    DRIVE_FILE_FIELDS,
+    DRIVE_FILE_ID,
+    DRIVE_FILE_MD5_CHECKSUM,
+    DRIVE_FILE_MODIFIED_TIME,
+    DRIVE_FILE_SIZE,
+    DRIVE_FOLDER_FILES_FINAL,
+    DRIVE_FOLDER_VIDEOS_FINAL,
+    DRIVE_MIMETYPE_FOLDER,
+    DriveFileStatus,
+)
+from gdrive_sync.models import DriveFile
+from gdrive_sync.utils import get_gdrive_file, get_resource_name
+from main.celery import app
+from main.constants import STATUS_CREATED
+from main.s3_utils import get_boto3_resource
+from videos import threeplay_api
+from videos.constants import (
+    ARCHIVE_URL_FILESIZE_TASK_RATE_LIMIT,
+    DESTINATION_YOUTUBE,
+    S3_FILESIZE_TASK_RATE_LIMIT,
+    YT_THUMBNAIL_IMG,
+    YTAGS_BATCH_LOCK_TTL,
+    VideoFileStatus,
+    VideoStatus,
+    YouTubeStatus,
+)
+from videos.exceptions import (
+    raise_head_request_error,
+    raise_invalid_response_error,
+    raise_missing_file_metadata_error,
+)
+from videos.models import Video, VideoFile
+from videos.threeplay_sync import link_threeplay_files_as_resources
+from videos.utils import (
+    create_new_content,
+    fetch_youtube_snippets,
+    parse_caption_language_locale,
+    process_video_tags,
+)
+from videos.youtube import (
+    API_QUOTA_ERROR_MSG,
+    YouTubeApi,
+    is_youtube_enabled,
+    mail_youtube_upload_failure,
+    mail_youtube_upload_success,
+)
+from websites.api import (
+    is_ocw_site,
+    sync_website_content_references,
+    videos_missing_captions,
+)
+from websites.constants import RESOURCE_TYPE_VIDEO
+from websites.messages import VideoTranscriptingCompleteMessage
+from websites.models import Website, WebsiteContent
+from websites.utils import get_dict_field, get_dict_query_field, set_dict_field
+
+log = logging.getLogger()
+
+
+@app.task
+@single_task(timeout=settings.YT_UPLOAD_FREQUENCY, raise_block=False)
+def upload_youtube_videos():  # noqa: C901
+    """
+    Upload public videos one at a time to YouTube (if not already there) until the daily maximum is reached.
+    """  # noqa: E501
+    if not is_youtube_enabled():
+        return
+    yt_queue = VideoFile.objects.filter(
+        Q(destination=DESTINATION_YOUTUBE)
+        & Q(destination_id__isnull=True)
+        & Q(status=STATUS_CREATED)
+    ).order_by("-created_on")[: settings.YT_UPLOAD_LIMIT]
+    if yt_queue.count() == 0:
+        return
+    youtube = YouTubeApi()
+
+    for video_file in yt_queue:
+        error_msg = None
+        try:
+            # Get existing tags from WebsiteContent before upload
+            existing_tags = ""
+            drive_file = DriveFile.objects.filter(video=video_file.video).first()
+            if drive_file and drive_file.resource:
+                existing_tags = get_dict_field(
+                    drive_file.resource.metadata, settings.YT_FIELD_TAGS
+                )
+
+            response, merged_tags = youtube.upload_video(
+                video_file, existing_tags=existing_tags
+            )
+            video_file.destination_id = response["id"]
+            video_file.destination_status = response["status"]["uploadStatus"]
+            video_file.status = VideoFileStatus.UPLOADED
+
+        except HttpError as error:
+            error_msg = error.content.decode("utf-8")
+            if API_QUOTA_ERROR_MSG in error_msg:
+                break
+            log.exception("HttpError uploading video to Youtube: %s", video_file.s3_key)
+            video_file.status = VideoFileStatus.FAILED
+        except:  # pylint: disable=bare-except  # noqa: E722
+            log.exception("Error uploading video to Youtube: %s", video_file.s3_key)
+            video_file.status = VideoFileStatus.FAILED
+        else:
+            # Save the merged tags back to the video metadata (only on success)
+            if merged_tags and drive_file and drive_file.resource:
+                video_resource = drive_file.resource
+                set_dict_field(
+                    video_resource.metadata, settings.YT_FIELD_TAGS, merged_tags
+                )
+                video_resource.save(update_fields=["metadata", "updated_on"])
+
+        # Always save video_file status
+        video_file.save()
+        if error_msg:
+            mail_youtube_upload_failure(video_file)
+
+
+@app.task(
+    acks_late=True,
+    retry_backoff=15,  # Base delay of 15 seconds
+    max_retries=3,
+    bind=True,  # Bind to access retry count
+)
+def start_transcript_job(self, video_id: int, timeout_override: int | None = None):
+    """
+    If there are existing captions or transcript, associate them with the video;
+    otherwise, use the 3Play API to order a new transcript for video
+    """
+    # Use configurable base timeout from settings or override from retry
+    retry_count = self.request.retries
+    base_timeout = settings.THREEPLAY_BASE_TIMEOUT
+    request_timeout = timeout_override or base_timeout
+
+    video = Video.objects.filter(pk=video_id).last()
+    folder_name = video.website.short_id
+    youtube_id = video.youtube_id()
+
+    query_youtube_id_field = get_dict_query_field("metadata", settings.YT_FIELD_ID)
+
+    video_resource = (
+        WebsiteContent.objects.filter(website=video.website)
+        .filter(Q(**{query_youtube_id_field: youtube_id}))
+        .first()
+    )
+
+    captions_list, transcripts_list = video.caption_transcript_resources()
+
+    if captions_list or transcripts_list:  # check for existing captions or transcript
+        website = video.website
+        if captions_list:
+            set_dict_field(
+                video_resource.metadata,
+                settings.YT_FIELD_CAPTIONS_RESOURCES,
+                {
+                    "content": [str(r.text_id) for r in captions_list],
+                    "website": website.name,
+                },
+            )
+        if transcripts_list:
+            set_dict_field(
+                video_resource.metadata,
+                settings.YT_FIELD_TRANSCRIPT_RESOURCES,
+                {
+                    "content": [str(r.text_id) for r in transcripts_list],
+                    "website": website.name,
+                },
+            )
+        video_resource.save()
+
+    # if none and video is not already submitted, request a transcript through the 3Play API  # noqa: E501
+    else:
+        try:
+            response = threeplay_api.threeplay_upload_video_request(
+                folder_name, youtube_id, video_resource.title, timeout=request_timeout
+            )
+
+            # Check if response has the expected structure
+            if not response or not response.get("data"):
+                raise_invalid_response_error(video_id, response)
+
+            threeplay_file_id = response["data"].get("id")
+
+            if (
+                threeplay_file_id
+                and video.status != VideoStatus.SUBMITTED_FOR_TRANSCRIPTION
+            ):
+                threeplay_api.threeplay_order_transcript_request(
+                    video.id, threeplay_file_id, timeout=request_timeout
+                )
+                video.status = VideoStatus.SUBMITTED_FOR_TRANSCRIPTION
+                video.save()
+        except requests.exceptions.Timeout as exc:
+            # Increment timeout for timeout-specific retries
+            new_timeout = request_timeout + base_timeout
+            log.exception(
+                "Timeout error submitting 3Play transcript order for video %s "
+                "(retry %d, timeout %ds -> %ds)",
+                video_id,
+                retry_count,
+                request_timeout,
+                new_timeout,
+            )
+            # Retry with increased timeout
+            self.retry(exc=exc, kwargs={"timeout_override": new_timeout})
+        except (requests.exceptions.RequestException, ConnectionError) as exc:
+            log.exception(
+                "Error submitting 3Play transcript order for video %s "
+                "(retry %d, timeout %ds)",
+                video_id,
+                retry_count,
+                request_timeout,
+            )
+            # Retry the task with exponential backoff but same timeout
+            self.retry(exc=exc)
+        except Exception:
+            log.exception("Unexpected error in transcript job for video %s", video_id)
+            # Don't retry for unexpected errors, just log and fail
+            raise
+
+
+@app.task(bind=True)
+@single_task(timeout=settings.YT_STATUS_UPDATE_FREQUENCY, raise_block=False)
+def update_youtube_statuses(self):
+    """
+    Update the status of recently uploaded YouTube videos if complete
+    """
+    if not is_youtube_enabled():
+        return None
+    videos_processing = VideoFile.objects.filter(
+        Q(status=VideoFileStatus.UPLOADED) & Q(destination=DESTINATION_YOUTUBE)
+    )
+    if videos_processing.count() == 0:
+        return None
+    youtube = YouTubeApi()
+    group_tasks = []
+    for video_file in videos_processing:
+        try:
+            with transaction.atomic():
+                if video_file.destination_status != YouTubeStatus.PROCESSED:
+                    video_file.destination_status = youtube.video_status(
+                        video_file.destination_id
+                    )
+                    video_file.save()
+                drive_file = DriveFile.objects.filter(video=video_file.video).first()
+                if (
+                    video_file.destination_status == YouTubeStatus.PROCESSED
+                    and drive_file
+                    and drive_file.resource
+                ):
+                    resource = drive_file.resource
+                    set_dict_field(
+                        resource.metadata,
+                        settings.YT_FIELD_ID,
+                        video_file.destination_id,
+                    )
+                    set_dict_field(
+                        resource.metadata,
+                        settings.YT_FIELD_THUMBNAIL,
+                        YT_THUMBNAIL_IMG.format(video_id=video_file.destination_id),
+                    )
+                    resource.save()
+                    video_file.status = VideoFileStatus.COMPLETE
+                    video_file.save()
+                    group_tasks.append(start_transcript_job.s(video_file.video.id))
+                    mail_youtube_upload_success(video_file)
+
+        except IndexError:
+            # Video might be a dupe or deleted, mark it as failed and continue to next one.  # noqa: E501
+            video_file.status = VideoFileStatus.FAILED
+            video_file.save()
+            log.exception(
+                "Status of YouTube video not found: youtube_id %s",
+                video_file.destination_id,
+            )
+            mail_youtube_upload_failure(video_file)
+        except HttpError as error:
+            if API_QUOTA_ERROR_MSG in error.content.decode("utf-8"):
+                # Don't raise the error, task will try on next run until daily quota is reset  # noqa: E501
+                break
+            log.exception(
+                "Error for youtube_id %s: %s",
+                video_file.destination_id,
+                error.content.decode("utf-8"),
+            )
+            mail_youtube_upload_failure(video_file)
+
+    if group_tasks:
+        return self.replace(celery.group(group_tasks))
+    return None
+
+
+@app.task(acks_late=True)
+def delete_s3_objects(
+    key: str,
+    as_filter: bool = False,  # noqa: FBT001, FBT002
+):  # pylint:disable=unused-argument
+    """
+    Delete objects from an S3 bucket
+    """
+    s3 = get_boto3_resource("s3")
+    bucket = s3.Bucket(settings.AWS_STORAGE_BUCKET_NAME)
+    if not as_filter:
+        bucket.delete_objects(Delete={"Objects": [{"Key": key}]})
+    else:
+        for obj in bucket.objects.filter(Prefix=key):
+            obj.delete()
+
+
+def _has_english_resource(resources):
+    """Return True if any resource resolves to English via its real file path.
+
+    3Play only ever provides an English transcript/caption (see
+    videos.threeplay_sync.link_threeplay_files_as_resources), so only an
+    existing English resource should gate a 3Play fetch -- an existing
+    French/Spanish/etc resource must not block fetching the English one.
+    """
+    return any(
+        parse_caption_language_locale(r.file.name)[0] == "en"
+        for r in resources
+        if r.file
+    )
+
+
+@app.task(acks_late=True)
+@single_task(
+    timeout=settings.UPDATE_TAGGED_3PLAY_TRANSCRIPT_FREQUENCY, raise_block=False
+)
+def update_transcripts_for_video(video_id: int):  # noqa: C901, PLR0912
+    """Update transcripts for a video"""
+    video = Video.objects.get(id=video_id)
+    captions_list, transcripts_list = video.caption_transcript_resources()
+
+    website = video.website
+    video_resources = []
+    if is_ocw_site(website):
+        search_fields = {}
+        search_fields[get_dict_query_field("metadata", settings.FIELD_RESOURCETYPE)] = (
+            RESOURCE_TYPE_VIDEO
+        )
+        search_fields[get_dict_query_field("metadata", settings.YT_FIELD_ID)] = (
+            video.youtube_id()
+        )
+        video_resources = list(website.websitecontent_set.filter(**search_fields))
+
+    # Only the language check is new here: every process that creates a
+    # caption/transcript resource (GDrive ingestion, 3Play's own sync, the
+    # one-off orphan backfill) names it with the "{base_stem}_captions" /
+    # "{base_stem}_transcript" convention that caption_transcript_resources()
+    # already searches, so no extra lookup is needed to see them. A
+    # French/Spanish/etc resource must not count as coverage, though, since
+    # 3Play only ever supplies English.
+    has_threeplay_update = (
+        False
+        if (
+            _has_english_resource(captions_list)
+            or _has_english_resource(transcripts_list)
+        )
+        else threeplay_api.update_transcripts_for_video(video)
+    )
+    if not captions_list and not transcripts_list and not has_threeplay_update:
+        return
+
+    first_transcript_download = False
+
+    if video.status != VideoStatus.COMPLETE:
+        video.status = VideoStatus.COMPLETE
+        video.save()
+        if has_threeplay_update:
+            first_transcript_download = True
+
+    if video_resources:  # pylint: disable=too-many-nested-blocks
+        for video_resource in video_resources:
+            if has_threeplay_update:
+                # Create resources from the downloaded 3Play files and link
+                # them via the _resources relation fields. The legacy _file
+                # fields in stored metadata are left untouched.
+                if link_threeplay_files_as_resources(video, video_resource):
+                    video_resource.save()
+                    sync_website_content_references(video_resource)
+            else:
+                resource_changed = False
+                for resource_list, resource_field in [
+                    (captions_list, settings.YT_FIELD_CAPTIONS_RESOURCES),
+                    (transcripts_list, settings.YT_FIELD_TRANSCRIPT_RESOURCES),
+                ]:
+                    if resource_list:
+                        new_relation = {
+                            "content": [str(r.text_id) for r in resource_list],
+                            "website": website.name,
+                        }
+                        current_value = get_dict_field(
+                            video_resource.metadata, resource_field
+                        )
+                        if current_value != new_relation:
+                            set_dict_field(
+                                video_resource.metadata,
+                                resource_field,
+                                new_relation,
+                            )
+                            resource_changed = True
+                if resource_changed:
+                    video_resource.save(update_fields=["metadata"])
+
+            if first_transcript_download and len(videos_missing_captions(website)) == 0:
+                mail_transcripts_complete_notification(website)
+
+
+@app.task(acks_late=True)
+@single_task(
+    timeout=settings.UPDATE_TAGGED_3PLAY_TRANSCRIPT_FREQUENCY, raise_block=False
+)
+def update_transcripts_for_updated_videos():
+    """Check 3play for transcripts with 'updated' tag and update their transcripts"""
+    updated_files_response = threeplay_api.threeplay_updated_media_file_request()
+    updated_video_data = updated_files_response.get("data")
+    if not updated_video_data:
+        return
+
+    for video_response in updated_video_data:
+        videofiles = VideoFile.objects.filter(
+            destination=DESTINATION_YOUTUBE,
+            destination_id=video_response.get("reference_id"),
+        )
+        videos = {videofile.video for videofile in videofiles}
+        for video in videos:
+            updated = update_transcripts_for_video(video.id)
+            if updated:
+                threeplay_api.threeplay_remove_tags(video_response.get("id"))
+
+
+@app.task(acks_late=True)
+@single_task(timeout=settings.UPDATE_MISSING_TRANSCRIPT_FREQUENCY, raise_block=False)
+def attempt_to_update_missing_transcripts():
+    """Check 3play for transcripts for published videos without transcripts"""
+    videos = Video.objects.filter(
+        Q(pdf_transcript_file__isnull=True)
+        | Q(pdf_transcript_file="")
+        | Q(webvtt_transcript_file__isnull=True)
+        | Q(webvtt_transcript_file="")
+    ).filter(website__publish_date__isnull=False)
+
+    for video in videos:
+        if (
+            VideoFile.objects.filter(
+                destination=DESTINATION_YOUTUBE,
+                destination_id__isnull=False,
+                video=video,
+            ).count()
+            > 0
+        ):
+            update_transcripts_for_video.delay(video.id)
+
+
+@app.task(acks_late=True)
+def update_transcripts_for_website(
+    website: Website,
+    **kwargs,  # noqa: ARG001
+):  # pylint:disable=unused-argument
+    """Update transcripts from 3play for every video for a website"""
+
+    for video in website.videos.all():
+        update_transcripts_for_video(video.id)
+
+
+def mail_transcripts_complete_notification(website: Website):
+    """Notify collaborators that 3play completed video transcripts"""
+    with get_message_sender(VideoTranscriptingCompleteMessage) as sender:
+        for collaborator in website.collaborators:
+            sender.build_and_send_message(
+                collaborator,
+                {
+                    "site": {
+                        "title": website.title,
+                        "url": urljoin(
+                            settings.SITE_BASE_URL,
+                            f"sites/{website.name}",
+                        ),
+                    },
+                },
+            )
+
+
+def copy_gdrive_file(gdrive_file, destination_course):
+    """
+    Copy a Google Drive file to destination course.
+    """
+    gdrive_service = get_drive_service()
+    file_id = gdrive_file.file_id
+    gdrive_file = (
+        gdrive_service.files()
+        .get(fileId=file_id, fields="id, parents", supportsAllDrives=True)
+        .execute()
+    )
+    new_folder_id = destination_course.gdrive_folder
+    original_parent_id = gdrive_file["parents"][0]
+    original_parent = (
+        gdrive_service.files()
+        .get(fileId=original_parent_id, fields="name", supportsAllDrives=True)
+        .execute()
+    )
+    original_parent_name = original_parent.get(
+        "name"
+    )  # either files_final or videos_final
+    gdrive_query = (
+        f'parents = "{new_folder_id}" and name = "{original_parent_name}" '
+        f'and mimeType = "{DRIVE_MIMETYPE_FOLDER}" and not trashed'
+    )
+    gdrive_files = list(query_files(query=gdrive_query, fields=DRIVE_FILE_FIELDS))
+    new_parent_id = gdrive_files[0].get(
+        "id"
+    )  # ID of either files_final or videos_final folder
+    new_file = (
+        gdrive_service.files()
+        .copy(
+            fileId=file_id,
+            body={"parents": [new_parent_id]},
+            fields="id, parents",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return new_file.get("id")
+
+
+def create_drivefile(gdrive_file_id, new_resource, destination_course, files_or_videos):
+    """
+    Create a DriveFile for gdrive_file in the destination course.
+    """
+    gdrive_service = get_drive_service()
+    files_or_videos = (
+        DRIVE_FOLDER_FILES_FINAL
+        if files_or_videos == "files"
+        else DRIVE_FOLDER_VIDEOS_FINAL
+    )
+    gdrive_dl = get_gdrive_file(gdrive_service, gdrive_file_id)
+    DriveFile.objects.update_or_create(
+        file_id=gdrive_dl.get(DRIVE_FILE_ID),
+        defaults={
+            "checksum": gdrive_dl.get(DRIVE_FILE_MD5_CHECKSUM),
+            "name": get_resource_name(new_resource),
+            "mime_type": new_resource.metadata["file_type"],
+            "status": DriveFileStatus.COMPLETE,
+            "website": destination_course,
+            "s3_key": str(new_resource.file).lstrip("/"),
+            "resource": new_resource,
+            "drive_path": (f"{destination_course.short_id}/{files_or_videos}"),
+            "modified_time": gdrive_dl.get(DRIVE_FILE_MODIFIED_TIME),
+            "created_time": gdrive_dl.get(DRIVE_FILE_CREATED_TIME),
+            "size": gdrive_dl.get(DRIVE_FILE_SIZE),
+            "download_link": gdrive_dl.get(DRIVE_FILE_DOWNLOAD_LINK),
+            "sync_dt": now_in_utc(),
+        },
+    )
+
+
+@app.task(acks_late=True)
+def copy_video_resource(source_course_id, destination_course_id, source_resource_id):
+    """
+    Copy a video resource and associated captions/transcripts (celery task).
+
+    Captions and transcripts are discovered via the ``video_captions_resources`` and
+    ``video_transcript_resources`` relation fields introduced in migration 0075.  For
+    each linked resource the content record is copied to the destination course and the
+    relation field on the new video resource is updated to point at the copy.  The
+    legacy ``_file`` fields in stored metadata are left untouched.  Associated Google
+    Drive files are also copied when present.
+    """
+    source_course = Website.objects.get(uuid=source_course_id)
+    destination_course = Website.objects.get(uuid=destination_course_id)
+    source_resource = WebsiteContent.objects.get(
+        website=source_course, text_id=source_resource_id
+    )
+    new_resource = create_new_content(source_resource, destination_course)
+
+    for resource_field in (
+        settings.YT_FIELD_CAPTIONS_RESOURCES,
+        settings.YT_FIELD_TRANSCRIPT_RESOURCES,
+    ):
+        relation = get_dict_field(source_resource.metadata, resource_field) or {}
+        content_ids = relation.get("content") or []
+        if isinstance(content_ids, str):
+            content_ids = [content_ids] if content_ids else []
+
+        new_ids = []
+        for text_id in content_ids:
+            source_content = WebsiteContent.objects.filter(
+                website=source_course, text_id=text_id
+            ).first()
+            if not source_content:
+                continue
+            new_content = create_new_content(source_content, destination_course)
+            new_ids.append(str(new_content.text_id))
+
+            # Copy the associated DriveFile if one exists.
+            if source_content.file and source_content.file.name:
+                gdrive_file = DriveFile.objects.filter(
+                    s3_key=source_content.file.name.lstrip("/")
+                ).first()
+                if gdrive_file:
+                    new_gdrive_file_id = copy_gdrive_file(
+                        gdrive_file, destination_course
+                    )
+                    create_drivefile(
+                        new_gdrive_file_id,
+                        new_content,
+                        destination_course,
+                        "files",
+                    )
+
+        if new_ids:
+            set_dict_field(
+                new_resource.metadata,
+                resource_field,
+                {"content": new_ids, "website": destination_course.name},
+            )
+
+    new_resource.save()
+    sync_website_content_references(new_resource)
+
+    videofile = VideoFile.objects.filter(
+        video__website=source_course,
+        destination="youtube",
+        destination_id=source_resource.metadata.get("youtube_id"),
+    ).first()
+
+    if videofile:
+        video = videofile.video
+        Video.objects.create(
+            website_content=new_resource,
+            video_id=video.video_id,
+            status=video.status,
+        )
+
+        gdrive_file = DriveFile.objects.filter(video=video).first()
+        if gdrive_file:
+            new_gdrive_file = copy_gdrive_file(gdrive_file, destination_course)
+            create_drivefile(
+                new_gdrive_file, new_resource, destination_course, "videos"
+            )
+
+
+@app.task(
+    bind=True,
+    acks_late=True,
+    retry_backoff=30,
+    max_retries=3,
+    rate_limit=ARCHIVE_URL_FILESIZE_TASK_RATE_LIMIT,
+)
+def populate_video_file_size(self, video_content_id: int):
+    """
+    Populate the file size for a video by making a HEAD request to its archive_url.
+    """
+    try:
+        retry_count = self.request.retries
+        request_timeout = settings.ARCHIVE_URL_REQUEST_TIMEOUT + (retry_count * 60)
+        video = WebsiteContent.objects.get(id=video_content_id)
+        archive_url = (video.metadata or {}).get("video_files", {}).get("archive_url")
+        response = requests.head(
+            archive_url,
+            allow_redirects=True,
+            timeout=request_timeout,
+        )
+        if response.status_code == HTTP_200_OK and "Content-Length" in response.headers:
+            video.metadata["file_size"] = int(response.headers["Content-Length"])
+            video.skip_sync = True
+            video.save(update_fields=["metadata"])
+        else:
+            raise_head_request_error(response.status_code, video.title)
+
+    except requests.RequestException as exc:
+        log.exception(
+            "Request error while populating file size for video %s from course %s",
+            video.title,
+            video.website.short_id,
+        )
+        raise self.retry(exc=exc) from exc
+
+    except Exception as exc:
+        log.exception(
+            "Unhandled error while populating file size for video %s from course %s",
+            video.title,
+            video.website.short_id,
+        )
+        raise self.retry(exc=exc) from exc
+
+
+@app.task(
+    bind=True,
+    acks_late=True,
+    retry_backoff=30,
+    max_retries=3,
+    rate_limit=S3_FILESIZE_TASK_RATE_LIMIT,
+)
+def backfill_caption_or_transcript_file_size(self, resource_id: int):
+    """
+    Populate file and file_size for a caption or transcript resource.
+    Uses metadata["file"] to get the S3 path and fetch its size.
+    """
+    resource = None
+    try:
+        resource = WebsiteContent.objects.get(id=resource_id)
+        s3_path = (resource.metadata or {}).get("file")
+        if not s3_path:
+            raise_missing_file_metadata_error(resource.filename)
+
+        s3_key = s3_path.lstrip("/")
+        s3 = get_boto3_resource("s3")
+        s3_obj = s3.Object(settings.AWS_STORAGE_BUCKET_NAME, s3_key)
+        file_size = s3_obj.content_length
+
+        resource.file = s3_path
+        resource.metadata["file_size"] = file_size
+        resource.skip_sync = True
+        resource.save(update_fields=["file", "metadata"])
+
+    except Exception as exc:
+        log.exception(
+            "Error backfilling file size for %s in course %s",
+            resource.title,
+            resource.website.short_id,
+        )
+        raise self.retry(exc=exc) from exc
+
+
+def _build_yt_id_resource_map(youtube_ids):
+    """Build a mapping of youtube_id -> list of WebsiteContent resources."""
+    query_id_field = f"metadata__{settings.YT_FIELD_ID.replace('.', '__')}"
+    video_resources = WebsiteContent.objects.filter(
+        **{f"{query_id_field}__in": youtube_ids},
+        metadata__resourcetype=RESOURCE_TYPE_VIDEO,
+    )
+    yt_id_to_resources = {}
+    for vr in video_resources:
+        yt_id = get_dict_field(vr.metadata, settings.YT_FIELD_ID)
+        if yt_id:
+            yt_id_to_resources.setdefault(yt_id, []).append(vr)
+    return yt_id_to_resources
+
+
+def _process_batch_videos(
+    youtube_ids, yt_id_to_resources, snippets, youtube, *, add_course_tag
+):
+    """Process all videos in a batch, returning (success, skipped, error) counts."""
+    success_count = 0
+    error_count = 0
+    skipped_count = 0
+
+    for yt_id in youtube_ids:
+        resources = yt_id_to_resources.get(yt_id, [])
+        snippet = snippets.get(yt_id)
+
+        if not snippet:
+            log.warning("Video %s not found on YouTube, skipping", yt_id)
+            error_count += 1
+            continue
+
+        for video_resource in resources:
+            try:
+                result = process_video_tags(
+                    video_resource,
+                    snippet,
+                    youtube,
+                    add_course_tag=add_course_tag,
+                )
+                if result == "success":
+                    success_count += 1
+                else:
+                    skipped_count += 1
+            except HttpError:
+                raise
+            except Exception:
+                log.exception("Error updating tags for %s", yt_id)
+                error_count += 1
+
+    return success_count, skipped_count, error_count
+
+
+@app.task(bind=True, max_retries=3)
+@single_task(timeout=YTAGS_BATCH_LOCK_TTL, raise_block=False)
+def update_youtube_tags_batch(
+    self,
+    youtube_ids,
+    *,
+    add_course_tag=False,
+):
+    """
+    Update YouTube tags for a batch of videos identified by youtube_ids.
+
+    Only one instance runs at a time cluster-wide (enforced by the
+    @single_task Redis lock). Duplicate messages delivered by the broker
+    after a pod restart are silently dropped by the lock; if they fire
+    after the first copy has already completed, process_video_tags() detects
+    no tag changes and skips the videos.update call, spending only the
+    cheap videos.list quota.
+
+    This task is designed to be scheduled with a countdown/eta so that
+    large tag-update operations can be spread across multiple days
+    without exceeding the YouTube API daily quota.
+
+    Args:
+        youtube_ids: List of YouTube video IDs to update
+        add_course_tag: Whether to add course slug as a tag
+    """
+    if not is_youtube_enabled():
+        log.warning("YouTube is not enabled, skipping tag update batch")
+        return
+
+    youtube = YouTubeApi()
+
+    yt_id_to_resources = _build_yt_id_resource_map(youtube_ids)
+    if not yt_id_to_resources:
+        log.info("No video resources found for youtube_ids batch")
+        return
+
+    try:
+        snippets = fetch_youtube_snippets(youtube, youtube_ids)
+        success_count, skipped_count, error_count = _process_batch_videos(
+            youtube_ids,
+            yt_id_to_resources,
+            snippets,
+            youtube,
+            add_course_tag=add_course_tag,
+        )
+    except HttpError as exc:
+        if API_QUOTA_ERROR_MSG in str(exc).lower():
+            log.warning(
+                "YouTube API quota exceeded, will retry: %s",
+                exc,
+            )
+            raise self.retry(exc=exc, countdown=6 * 3600) from exc
+        raise
+
+    log.info(
+        "YouTube tag batch complete: %d updated, %d skipped, %d errors",
+        success_count,
+        skipped_count,
+        error_count,
+    )

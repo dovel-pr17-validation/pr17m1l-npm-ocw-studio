@@ -1,0 +1,479 @@
+"""Websites utils"""
+
+import logging
+import re
+from typing import Any
+
+from django.apps import apps
+from django.conf import settings
+from django.db.models import Q
+
+from websites import constants
+
+log = logging.getLogger(__name__)
+
+UUID_REGEX_STR = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+# Legacy S3 filenames were prefixed with a bare 32-hex-char UUID (no dashes),
+# e.g. "ab3d029952cda060f4afcd811189a591_photo.jpg". Shared by
+# remove_uuid_from_filenames and the gallery_image_rename markdown_cleaning
+# rule, so it lives here rather than in either command module to avoid a
+# circular import between them.
+UUID_FILENAME_RE = re.compile(r"^[0-9a-f]{32}_", re.IGNORECASE)
+
+# Compiled regexes for parse_resource_uuid (moved to module scope for performance)
+_RESOURCE_LINK_AND_EMBED_REGEX = re.compile(
+    rf"""
+    \{{\{{%\s+resource_link\s+(?:\\?")?({UUID_REGEX_STR})(?:\\?")?\s+\\?"(.+?)\\?"\s+%\}}\}}
+    |
+    \{{\{{<\s+resource\s+([^>]*)>\}}\}}
+    |
+    \{{\{{<\s+image-gallery-item\s+((?:[^"]|"(?:[^"\\]|\\.)*")*?)>\}}\}}
+    """,
+    re.VERBOSE,
+)
+_ATTRIBUTE_UUID_REGEX = re.compile(
+    rf'(?:^|\s)(?:uuid|href_uuid|href-uuid)\s*=\s*"?({UUID_REGEX_STR})"?(?=\s|$)'
+)
+_POSITIONAL_UUID_REGEX = re.compile(rf'^\s*"?({UUID_REGEX_STR})"?(?=\s|$)')
+
+
+def permissions_group_name_for_role(role, website):
+    """Get the website group name for a given role"""
+    if role == constants.ROLE_GLOBAL:
+        return constants.GLOBAL_ADMIN
+    elif role in constants.ROLE_GROUP_MAPPING:
+        return f"{constants.ROLE_GROUP_MAPPING[role]}{website.uuid.hex}"
+    else:
+        msg = f"Invalid role for a website group: {role}"
+        raise ValueError(msg)
+
+
+def get_dict_field(obj: dict, field_path: str) -> Any:
+    """Return the value of a potentially nested dict path"""
+    fields = field_path.split(".")
+    current_obj = obj
+    for field in fields[:-1]:
+        current_obj = current_obj.get(field, {})
+        if not isinstance(current_obj, dict):
+            return None
+    return current_obj.get(fields[-1])
+
+
+def set_dict_field(obj: dict, field_path: str, value: Any):
+    """Set the value of a potentially nested dict path"""
+    fields = field_path.split(".")
+    current_obj = obj
+    for field in fields[:-1]:
+        current_obj_field = current_obj.get(field)
+        if current_obj_field:
+            current_obj = current_obj_field
+        else:
+            current_obj[field] = {}
+            current_obj = current_obj[field]
+    current_obj[fields[-1]] = value
+
+
+def get_dict_query_field(dict_field_name: str, sub_field: str):
+    """Generate django query key for searching a nested json feild"""
+    return dict_field_name + "__" + sub_field.replace(".", "__")
+
+
+def query_field_is_empty(
+    field_path: str,
+    empty_values: tuple = (None, ""),
+    *,
+    include_isnull: bool = True,
+) -> Q:
+    """
+    Build a Q object matching a metadata field that is null/missing (if
+    ``include_isnull`` is True) or equal to any of the given ``empty_values``.
+    """
+    query_field = get_dict_query_field("metadata", field_path)
+    q = Q(**{f"{query_field}__isnull": True}) if include_isnull else None
+    for value in empty_values:
+        empty_q = Q(**{query_field: value})
+        q = empty_q if q is None else q | empty_q
+    return q
+
+
+def strip_uuid_prefix(path: str) -> str:
+    """
+    Strip a UUID prefix from the basename of a path value.
+
+    Handles values stored with or without a leading slash.
+    Returns the original value unchanged if no UUID prefix is found or if
+    stripping would leave an empty basename.
+    """
+    stripped = path.lstrip("/")
+    lead = path[: len(path) - len(stripped)]  # "" or "/"
+    prefix_path, _, basename = stripped.rpartition("/")
+    if not UUID_FILENAME_RE.match(basename):
+        return path
+    new_basename = basename[33:]  # 32 hex chars + 1 underscore
+    if not new_basename:
+        return path
+    new_path = f"{prefix_path}/{new_basename}" if prefix_path else new_basename
+    return f"{lead}{new_path}"
+
+
+def get_valid_base_filename(filename: str, content_type: str) -> str:
+    """Avoid forbidden filenames that could confuse hugo"""
+    if filename in constants.CONTENT_FILENAMES_FORBIDDEN:
+        return f"{filename}-{content_type}"
+    return filename
+
+
+def resource_reference_field_filter(
+    field: dict,
+    resource_id: str,
+    website,
+) -> Q | None:
+    """
+    Generates an appropriate Q expression to filter a field for a resource usage.
+    """  # noqa: D401
+    q = None
+
+    if field.get("widget") == "markdown" and (
+        constants.CONTENT_TYPE_RESOURCE in field.get("link", [])
+        or constants.CONTENT_TYPE_RESOURCE in field.get("embed", [])
+    ):
+        q = Q(markdown__icontains=resource_id)
+    elif (
+        field.get("widget") == "relation"
+        and field.get("collection") == constants.CONTENT_TYPE_RESOURCE
+    ):
+        lookup_args = ["metadata", field["name"], "content"]
+
+        if field.get("multiple", False):
+            lookup_args.append("contains")
+
+        lookup = "__".join(lookup_args)
+
+        value = (
+            resource_id
+            if not field.get("cross_site", False)
+            else [[resource_id, website.url_path]]
+        )
+
+        q = Q(**{lookup: value})
+    elif field.get("widget") == "menu":
+        lookup = "__".join(("metadata", field.get("name"), "contains"))
+        q = Q(**{lookup: [{"identifier": resource_id}]})
+
+    return q
+
+
+def is_test_site(site_name: str) -> bool:
+    """Return True if the provided site slug is configured as a test site."""
+    return site_name in settings.OCW_TEST_SITE_SLUGS
+
+
+def get_metadata_content_key(content) -> list:
+    """Get the metadata content keys based on the content type."""
+    content_type = content.type
+    match content_type:
+        case (
+            constants.CONTENT_TYPE_RESOURCE_LIST
+            | constants.CONTENT_TYPE_RESOURCE_COLLECTION
+        ):
+            content_keys = [
+                constants.METADATA_FIELD_DESCRIPTION,
+                constants.METADATA_FIELD_RESOURCES_CONTENT,
+            ]
+        case constants.CONTENT_TYPE_VIDEO_GALLERY:
+            content_keys = [constants.METADATA_FIELD_VIDEO_GALLERY_VIDEOS]
+        case constants.CONTENT_TYPE_METADATA:
+            content_keys = [
+                constants.METADATA_FIELD_COURSE_DESCRIPTION,
+                constants.INSTRUCTORS_FIELD_CONTENT,
+                constants.METADATA_FIELD_COURSE_IMAGE,
+                constants.METADATA_FIELD_COURSE_IMAGE_THUMBNAIL,
+            ]
+        case constants.CONTENT_TYPE_RESOURCE:
+            content_keys = [
+                constants.METADATA_FIELD_IMAGE_CAPTION,
+                constants.METADATA_FIELD_IMAGE_CREDIT,
+                settings.YT_FIELD_CAPTIONS_RESOURCES + ".content",
+                settings.YT_FIELD_TRANSCRIPT_RESOURCES + ".content",
+            ]
+        case constants.CONTENT_TYPE_COURSE_COLLECTION:
+            content_keys = [
+                constants.METADATA_FIELD_DESCRIPTION,
+                constants.METADATA_FIELD_COVER_IMAGE,
+                constants.METADATA_FIELD_COURSE_LISTS,
+                constants.METADATA_FIELD_FEATURED_COURSES,
+            ]
+        case constants.CONTENT_TYPE_COURSE_LIST:
+            content_keys = [
+                constants.METADATA_FIELD_DESCRIPTION,
+                constants.METADATA_FIELD_COURSE_LIST_COURSES,
+            ]
+        case (
+            constants.CONTENT_TYPE_PROMO
+            | constants.CONTENT_TYPE_TESTIMONIAL
+            | constants.CONTENT_TYPE_STORY
+        ):
+            content_keys = [constants.METADATA_FIELD_IMAGE]
+        case constants.CONTENT_TYPE_HOMEPAGE_SETTINGS:
+            content_keys = [
+                constants.METADATA_FIELD_FEATURED_PROMOS,
+                constants.METADATA_FIELD_FEATURED_STORIES,
+            ]
+        case _:
+            content_keys = []
+
+    return content_keys
+
+
+def parse_resource_uuid(text: str) -> list[str]:
+    """
+    Parse the input text to extract UUIDs from resource links, resource embeds
+    and image gallery items.
+
+    Args:
+        text (str): The input text containing resource links.
+
+    Returns:
+        list[str]: A list of extracted UUIDs.
+    """
+    # This regex pattern matches three types of Hugo resource patterns:
+    # 1. Hugo shortcode syntax: {{% resource_link "uuid" "title" %}} or
+    #    {{% resource_link uuid "title" %}}, or with escaped quotes,
+    #    {{% resource_link \"uuid\" \"title\" %}}, inside another shortcode's
+    #    quoted param such as an image gallery caption
+    # 2. Hugo resource/embed syntax: {{< resource ... >}}
+    # 3. Hugo image gallery item syntax: {{< image-gallery-item uuid="uuid" ... >}}
+    #
+    # Pattern breakdown:
+    # - Pattern 1:
+    #   \{\{%\s+resource_link\s+(?:\\?")?([uuid])(?:\\?")?\s+\\?"(.+?)\\?"\s+%\}\}
+    #   - \{\{%     : Matches literal "{{%"
+    #   - \s+       : Matches one or more whitespace characters
+    #   - resource_link : Matches literal "resource_link"
+    #   - \s+       : Matches one or more whitespace characters
+    #   - (?:\\?")?([uuid])(?:\\?")? : Captures UUID in group 1 with optional,
+    #                    possibly escaped, quotes (full pattern below)
+    #   - \s+       : Matches one or more whitespace characters
+    #   - \\?"(.+?)\\?" : Captures title text in group 2
+    #   - \s+       : Matches one or more whitespace characters
+    #   - %\}\}     : Matches literal "%}}"
+    #
+    # - Pattern 2: \{\{<\s+resource\s+([^>]*)>\}\}
+    #   - \{\{<     : Matches literal "{{<"
+    #   - \s+       : Matches one or more whitespace characters
+    #   - resource  : Matches literal "resource"
+    #   - \s+       : Matches one or more whitespace characters
+    #   - ([^>]*)   : Captures all shortcode attributes in group 3
+    #   - >\}\}     : Matches literal ">}}"
+    #
+    # - Pattern 3: \{\{<\s+image-gallery-item\s+((?:[^"]|"(?:[^"\\]|\\.)*")*?)>\}\}
+    #   - \{\{<     : Matches literal "{{<"
+    #   - \s+       : Matches one or more whitespace characters
+    #   - image-gallery-item : Matches literal "image-gallery-item"
+    #   - \s+       : Matches one or more whitespace characters
+    #   - ((?:[^"]|"(?:[^"\\]|\\.)*")*?) : Captures all shortcode attributes in
+    #                    group 4, taking quoted values whole so that shortcodes
+    #                    nested in a caption do not end the match early
+    #   - >\}\}     : Matches literal ">}}"
+    #
+    # UUID format: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+    # Example: b02b216b-1e9e-4b5c-8b1b-9c275a834679
+    matches = _RESOURCE_LINK_AND_EMBED_REGEX.findall(text)
+
+    references = []
+    for match in matches:
+        if match[0]:
+            references.append(match[0])
+            continue
+
+        if match[3]:
+            references.extend(_ATTRIBUTE_UUID_REGEX.findall(match[3]))
+            # Links nested in the item's params, e.g. in its caption
+            references.extend(parse_resource_uuid(match[3]))
+            continue
+
+        if not match[2]:
+            continue
+
+        attr_references = _ATTRIBUTE_UUID_REGEX.findall(match[2])
+        if attr_references:
+            references.extend(attr_references)
+            continue
+
+        positional_match = _POSITIONAL_UUID_REGEX.match(match[2])
+        if positional_match:
+            references.append(positional_match.group(1))
+
+    return references
+
+
+def _extract_relation_text_ids(resource_data: list) -> list[str]:
+    """Extract text_id values from relation widget data."""
+    references = []
+    for relation_value in resource_data:
+        if isinstance(relation_value, str):
+            references.append(relation_value)
+        elif (
+            isinstance(relation_value, list)
+            and relation_value
+            and isinstance(relation_value[0], str)
+        ):
+            # Cross-site relation widgets can store entries as
+            # [text_id, website_name].
+            references.append(relation_value[0])
+        elif isinstance(relation_value, dict):
+            relation_id = relation_value.get("text_id") or relation_value.get("id")
+            if isinstance(relation_id, str):
+                references.append(relation_id)
+    return references
+
+
+def _get_sitemetadata_for_course_path(course_id: str):
+    """
+    Get the sitemetadata object for a course site url_path reference.
+
+    Args:
+        course_id: Course site url_path like "courses/test-spring-2001"
+
+    Returns:
+        The sitemetadata content object if found, None otherwise
+    """
+    normalized_path = course_id.strip().strip("/")
+
+    Website = apps.get_model("websites", "Website")
+    try:
+        website = Website.objects.get(url_path=normalized_path)
+        sitemetadata = website.websitecontent_set.filter(
+            type=constants.CONTENT_TYPE_METADATA
+        ).first()
+
+    except Website.DoesNotExist:
+        log.debug(
+            "Could not find website for course path: %s",
+            course_id,
+        )
+        sitemetadata = None
+
+    return sitemetadata
+
+
+def resolve_course_list_referenced_content_ids(content) -> set[int]:
+    """Resolve course-list course entries to concrete referenced content ids."""
+    referenced_content_ids = set()
+
+    courses = content.metadata.get(constants.METADATA_FIELD_COURSE_LIST_COURSES, [])
+    for course_entry in courses:
+        if not isinstance(course_entry, dict):
+            continue
+
+        course_id = course_entry.get("id")
+        if isinstance(course_id, str) and (
+            sitemetadata := _get_sitemetadata_for_course_path(course_id)
+        ):
+            referenced_content_ids.add(sitemetadata.id)
+
+    return referenced_content_ids
+
+
+def resolve_video_file_referenced_content_ids(content) -> set[int]:
+    """Resolve video_captions/transcript_resources content to WebsiteContent ids."""
+    WebsiteContent = apps.get_model("websites", "WebsiteContent")
+    referenced_ids = set()
+
+    for field_path in (
+        settings.YT_FIELD_CAPTIONS_RESOURCES,
+        settings.YT_FIELD_TRANSCRIPT_RESOURCES,
+    ):
+        relation = get_dict_field(content.metadata, field_path)
+        if not isinstance(relation, dict):
+            continue
+        text_ids = relation.get("content")
+        if isinstance(text_ids, str):
+            text_ids = [text_ids] if text_ids else []
+        elif not isinstance(text_ids, list):
+            continue
+        if not text_ids:
+            continue
+
+        related_ids = WebsiteContent.objects.filter(
+            website=content.website, text_id__in=text_ids
+        ).values_list("id", flat=True)
+        referenced_ids.update(related_ids)
+
+    return referenced_ids
+
+
+def _extract_references_from_metadata_key(content, content_key: str) -> list[str]:
+    """Extract text_id references from a single metadata key on a content item."""
+    resource_data = get_dict_field(content.metadata, content_key)
+    if not resource_data:
+        return []
+    if isinstance(resource_data, list):
+        return _extract_relation_text_ids(resource_data)
+    if isinstance(resource_data, str):
+        resource_data = resource_data.strip()
+        if re.fullmatch(UUID_REGEX_STR, resource_data):
+            return [resource_data]
+        return parse_resource_uuid(resource_data)
+    log.warning(
+        "Unexpected metadata type %s for key '%s' in content %s",
+        type(resource_data).__name__,
+        content_key,
+        content.text_id,
+    )
+    return []
+
+
+def compile_referencing_content(content) -> list[str]:
+    """Compile referencing content for a website content instance."""
+    references = []
+
+    if content.type == constants.CONTENT_TYPE_NAVMENU:
+        if content.metadata:
+            references = [
+                item["identifier"]
+                for item in content.metadata.get(constants.WEBSITE_CONTENT_LEFTNAV, [])
+                if item.get("identifier")
+            ]
+        return references
+
+    if content.markdown:
+        references += parse_resource_uuid(content.markdown)
+
+    if content.metadata:
+        content_keys = get_metadata_content_key(content)
+        if content.type == constants.CONTENT_TYPE_COURSE_LIST:
+            content_keys = [
+                k
+                for k in content_keys
+                if k != constants.METADATA_FIELD_COURSE_LIST_COURSES
+            ]
+        for content_key in content_keys:
+            references.extend(
+                _extract_references_from_metadata_key(content, content_key)
+            )
+    return references
+
+
+def resolve_referenced_content_ids(content) -> set[int]:
+    """Resolve referenced content to concrete WebsiteContent ids."""
+    WebsiteContent = apps.get_model("websites", "WebsiteContent")
+    reference_text_ids = compile_referencing_content(content)
+    referenced_content_ids = set(
+        WebsiteContent.objects.filter(text_id__in=reference_text_ids).values_list(
+            "id", flat=True
+        )
+    )
+
+    if content.type == constants.CONTENT_TYPE_COURSE_LIST and content.metadata:
+        referenced_content_ids.update(
+            resolve_course_list_referenced_content_ids(content)
+        )
+
+    if content.type == constants.CONTENT_TYPE_RESOURCE and content.metadata:
+        referenced_content_ids.update(
+            resolve_video_file_referenced_content_ids(content)
+        )
+
+    return referenced_content_ids

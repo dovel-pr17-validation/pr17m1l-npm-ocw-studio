@@ -1,0 +1,572 @@
+# ocw_studio
+
+OCW Studio manages deployments for OCW courses.
+
+**SECTIONS**
+
+- [ocw_studio](#ocw_studio)
+- [Initial Setup](#initial-setup)
+  - [Testing Keycloak login locally](#testing-keycloak-login-locally)
+  - [Commits](#commits)
+- [Testing and Formatting](#testing-and-formatting)
+  - [JS/CSS Tests and Linting](#jscss-tests-and-linting)
+    - [JS tests](#js-tests)
+    - [JS formatting, linting, and typechecking](#js-formatting-linting-and-typechecking)
+- [Defining local starter projects and site configs](#defining-local-starter-projects-and-site-configs)
+  - [The `localdev` folder](#the-localdev-folder)
+  - [Importing starter projects from Github](#importing-starter-projects-from-github)
+  - [Automatically updating starters from Github](#automatically-updating-starters-from-github)
+- [Enabling GitHub integration](#enabling-github-integration)
+- [Local S3 emulation with Minio](#local-s3-emulation-with-minio)
+- [Enabling Concourse-CI integration](#enabling-concourse-ci-integration)
+  - [Running a Local Concourse Docker Container](#running-a-local-concourse-docker-container)
+  - [End to end testing of site pipelines](#end-to-end-testing-of-site-pipelines)
+  - [Publish And Build Dates](#publish-and-build-dates)
+- [Video Workflow](#video-workflow)
+- [Enabling YouTube integration](#enabling-youtube-integration)
+- [Enabling Google Drive integration](#enabling-google-drive-integration)
+- [Enabling AWS MediaConvert transcoding](#enabling-aws-mediaconvert-transcoding)
+- [Enabling 3Play integration](#enabling-3play-integration)
+- [Enabling Open Catalog Search Webhooks](#enabling-open-catalog-search-webhooks)
+- [Checking External Resource Availability](#checking-external-resource-availability)
+- [Enabling PostHog Integration](#enabling-posthog-integration)
+- [Cloning Production Data](#cloning-production-data)
+
+# Initial Setup
+
+`ocw_studio` follows the same [initial setup steps outlined in the common ODL web app guide](https://mitodl.github.io/handbook/how-to/common-web-app-guide.html).
+Run through those steps **including the addition of `/etc/hosts` aliases and the optional step for running the
+`createsuperuser` command**.
+
+Websites are created using a template called a "starter." You can import a standard set of starters by running:
+
+```sh
+docker-compose exec web ./manage.py import_website_starters https://github.com/mitodl/ocw-hugo-projects
+```
+
+The `ocw-www` starter is meant for creating a home page, aka the "root website." This is called `ocw-www` by default, but the name of the site can be set on `ROOT_WEBSITE_NAME` in your environment if you wish to change it. The other starters are different types of websites that can be built within `ocw-studio`. After you have imported some starters, you are ready to start creating websites. To publish those websites, follow the guides in the table of contents above for setting up:
+
+- A Github organization
+- Google Drive integration for resources
+- AWS S3 credentials (Minio S3 emulation should work out of the box for local development)
+- Youtube / AWS MediaConvert / 3Play if you need to work with videos
+
+### Testing Keycloak login locally
+
+Keycloak runs automatically as part of the local Docker Compose stack. A pre-configured development realm is imported on startup from `config/keycloak/realms/ocw-studio-realm.json`.
+
+- Start the full stack (Keycloak will be available at `http://localhost:<KEYCLOAK_PORT>` once healthy):
+  ```sh
+  docker-compose up
+  ```
+- Add a local hosts alias for Keycloak in `/etc/hosts` so `kc.odl.local` resolves:
+  ```sh
+  127.0.0.1 kc.odl.local
+  ```
+- Set the following variables in your `.env` file (defaults for local dev are in `.env.example`):
+  ```sh
+  SOCIAL_AUTH_KEYCLOAK_KEY=<client ID registered in the realm>
+  SOCIAL_AUTH_KEYCLOAK_SECRET=<client secret from Keycloak admin console>
+  SOCIAL_AUTH_KEYCLOAK_AUTHORIZATION_URL=http://localhost:<KEYCLOAK_PORT>/realms/<realm>/protocol/openid-connect/auth
+  SOCIAL_AUTH_KEYCLOAK_ACCESS_TOKEN_URL=http://localhost:<KEYCLOAK_PORT>/realms/<realm>/protocol/openid-connect/token
+  ```
+- For local development, values in `.env.example` can be used as defaults for all of the variables above. The app verifies tokens against the realm's signing keys, which it fetches from the `/protocol/openid-connect/certs` endpoint next to `SOCIAL_AUTH_KEYCLOAK_ACCESS_TOKEN_URL`.
+- Navigate to the app and click **Login with MIT Keycloak**. You will be redirected to the Keycloak login page.
+- After a successful login you will be redirected back to the app and authenticated.
+- The development realm includes a default test user: **`admin@odl.local`** / **`admin`**.
+- To administer the local Keycloak instance (create users, inspect clients, etc.), log in to the Keycloak admin console at `http://localhost:<KEYCLOAK_PORT>` with the admin credentials defined in `docker-compose.yml`.
+
+> **Note:** Keycloak is used solely for authentication (verifying identity). Authorization — controlling what a user can do within the app — is handled entirely by ocw-studio itself.
+
+### Commits
+
+Code checks run with [prek](https://prek.j178.dev/), which reads `.pre-commit-config.yaml`.
+The `prek` check runs every hook on pull requests, and [autofix.ci](https://autofix.ci/) pushes any fixes.
+Install the Python and JavaScript dependencies, then replace any existing pre-commit git hook:
+
+```sh
+uv sync
+corepack enable
+yarn install --immutable
+uv run prek install -f
+uv run prek run --all-files
+```
+
+To automatically install prek hooks when cloning a repo, you can run this:
+
+```
+git config --global init.templateDir ~/.git-template
+uv run prek init-templatedir ~/.git-template
+```
+
+# Testing and Formatting
+
+Writing tests, running the test suite, and formatting code follows the same steps that are outlined in [the common ODL web app guide](https://mitodl.github.io/handbook/how-to/common-web-app-guide.html#testing-and-formatting).
+Below are some steps that may be particular to this project.
+
+## JS/CSS Tests and Linting
+
+The JS linting, testing, and formatting tools can be used either in the `watch`
+(node.js) container or on the host computer from the command line.
+
+To run these things in the Docker container, preface the commands below with
+`docker-compose run --rm watch`.
+
+### JS tests
+
+We use [Jest](https://jestjs.io/) for our JavaScript tests. It's a nice batteries-included
+testing framework built for testing React components from the ground up.
+
+To run the tests:
+
+```sh
+npm test
+```
+
+For watch mode (`jest --watch`):
+
+```sh
+npm run test:watch
+```
+
+To run a specific test by name:
+
+```sh
+npm test -- -t "my test name"
+```
+
+(note that this will find partial matches too).
+
+To generate a coverage report:
+
+```sh
+npm run test:coverage
+```
+
+### JS formatting, linting, and typechecking
+
+We're using TypeScript for typechecking, eslint for linting, and prettier for
+opinionated code formatting. Just as with the tests above, these commands can
+all be run ether in the Docker container or the host machine.
+
+To run the typechecker:
+
+```sh
+npm run typecheck
+```
+
+This runs `tsc --noEmit`, which basically typechecks the program and outputs
+any error but does not run a full compilation. We have incremental compilation
+turned on, so this should be relatively fast. It uses a file called
+`.tsbuildinfo` for incremental compilation.
+
+To run the linter:
+
+```sh
+npm run lint
+```
+
+And to format, try:
+
+```sh
+npm run fmt
+```
+
+You can also try `npm run fmt:check` to see if any files need to be reformatted.
+
+# Defining local starter projects and site configs
+
+The `ocw-studio` software allows you to create websites based on a configuration called a "starter." These configuration files are named `ocw-studio.yaml` by default but that name can be overridden by setting `OCW_STUDIO_SITE_CONFIG_FILE` in your environment. These starters can be imported into `ocw-studio` in a couple of different ways.
+
+### The `localdev` folder
+
+More details on this are in [this readme file](localdev/README.md)
+
+### Importing starter projects from Github
+
+MIT OCW has a set of starter configs that are used in building the official OCW site. They are stored in a repo called [`ocw-hugo-projects`](https://github.com/mitodl/ocw-hugo-projects). This repo can be used as a reference for setting up your own repo. When you make your own repo, make sure that your config files in the repo are in their own folder and the filenames match what is set to `OCW_STUDIO_SITE_CONFIG_FILE`, which is `ocw-studio.yaml` by default. The folder name is used to determine the `slug` property of the resulting starter object, and the config file is read from that folder and applied to the `config` property. When your repo is ready, make sure it is publically accessible and then you can import the starter configs from it by running:
+
+```sh
+docker-compose exec web ./manage.py import_website_starters https://github.com/mitodl/ocw-hugo-projects
+```
+
+If you wish to use your own Github repo containing starters use that URL instead. If any starters already exist with the same slug as one being imported, their configuration will be updated.
+
+### Automatically updating starters from Github
+
+If you are hosting `ocw-studio` on the internet and wish to have your starter updated automatically when you make changes to the starter configurations in your Github repo, this is possible by configuring a webhook. In order to accomplish this, you will need to first set `GITHUB_WEBHOOK_BRANCH` in your environment to the branch that you wish to watch for changes on (i.e. `release`). Then, you will need to configure a webhook in the settings of your Github repo targeting `/api/starters/site_configs` on your instance of `ocw-studio`. After this is set up, on pushes to the configured branch, a webhook will be fired to your `ocw-studio` instance which will trigger automatic updating of your starter configurations.
+
+### Following release tags of ocw-hugo-themes and ocw-hugo-projects
+
+`ocw-hugo-themes` and `ocw-hugo-projects` are released as tags only, by the Concourse release workflow, with no `release` or `release-candidate` branch advancing. How to cut a release is in the `Releasing` section of the [`ocw-hugo-themes`](https://github.com/mitodl/ocw-hugo-themes#releasing) and [`ocw-hugo-projects`](https://github.com/mitodl/ocw-hugo-projects#releasing) READMEs. This section is how `ocw-studio` follows those tags, and how to turn that on for an environment.
+
+With `OCW_HUGO_TAG_RELEASES=True` (outside dev), `GITHUB_WEBHOOK_BRANCH` keeps the value `release-candidate` or `release`, but it now names a pointer instead of a branch that exists:
+
+| `GITHUB_WEBHOOK_BRANCH` | Follows                                         | Example                  | Used by    |
+| ----------------------- | ----------------------------------------------- | ------------------------ | ---------- |
+| `release-candidate`     | the newest release tag, a bare calendar version | `2026.11.3.1`            | CI and QA  |
+| `release`               | the newest `production/` tag                    | `production/2026.11.3.1` | Production |
+
+Other tags, such as the old `v1.x` tags and `abandoned/...`, never match. The pointer decides:
+
+- the tag the theme-assets, end to end test, mass build and site pipelines clone `ocw-hugo-themes` and `ocw-hugo-projects` at. They use `version_type: tags` with an anchored regular expression, and a new tag triggers the theme-assets pipeline.
+- the `webpack.json` key in S3, which stays `ocw-hugo-themes/<pointer>/webpack.json` so it does not change per release.
+- which pushes the starter webhook acts on. It syncs every `ocw-studio.yaml` in the tagged commit when a matching tag is pushed, and ignores branch pushes, non-matching tags and tag deletions. It only syncs when the pushed tag is the newest match, so a redelivered older tag is ignored.
+
+`import_website_starters <url>` reads the newest matching tag, or the one named with `--tag`. In dev the setting has no effect and `OCW_HUGO_THEMES_BRANCH` and `OCW_HUGO_PROJECTS_BRANCH` still apply.
+
+#### Turning it on for an environment
+
+1. Make sure the tags the environment follows exist in both repos. CI and QA need at least one release tag in each. Production needs at least one `production/` tag in each, which only promoting a release creates. A pointer with no matching tag leaves pipelines with nothing to clone, so do not enable Production before the first promotion.
+2. In `ol-infrastructure`, add `OCW_HUGO_TAG_RELEASES: "True"` under `ocw_studio:vars` in `src/ol_infrastructure/applications/ocw_studio/Pulumi.<stack>.yaml`, next to `GITHUB_WEBHOOK_BRANCH`, and leave that one as it is. Deploy it. Do CI and QA first, and Production after its first `production/` tag exists.
+3. Re-upsert the pipelines. They only change when they are set again. Run these in the environment's `web` container, against its Concourse:
+   - `./manage.py upsert_theme_assets_pipeline`
+   - `./manage.py upsert_e2e_test_pipeline`
+   - `./manage.py upsert_mass_build_pipeline`, once for each existing instance, with the same `--prefix`, `--offline`, `--starter`, `--hugo_args`, `--theme-slug` and `--sync-with-delete` that instance was set with. The destructive instance (the one set with `--sync-with-delete`) is separate from the ordinary one, so leaving that flag out re-upserts the ordinary instance and the destructive one stays on the frozen branches.
+   - `./manage.py backpopulate_pipelines` for the site pipelines. There are thousands in Production, so try one site first with `--filter`. `--chunks` only sets how many sites each task handles, and every chunk is queued at once, so it does not pace the load on Concourse. For a controlled rollout, run several filtered invocations one after another and wait for each to finish.
+
+   Leave out `--themes-branch` and `--projects-branch` so each pipeline follows `GITHUB_WEBHOOK_BRANCH`, and leave out `--delete-all`.
+
+4. Check the result. In Concourse, the theme-assets pipeline's `ocw-hugo-themes-git` resource lists tags instead of branch commits, and a run of it publishes. `static/hash.txt` of the environment's site (`live-qa.ocw.mit.edu` for QA, `ocw.mit.edu` for Production) equals `git rev-parse <tag>^{commit}` for the tag it follows. A site pipeline's `ocw-hugo-themes-git` resource clones that same tag.
+5. Make sure the newest tags have been synced. A 2xx webhook delivery (repo settings, Webhooks, Recent Deliveries) only says the request was received: the task it queues ignores a tag that is not the newest match and can fail without updating a starter. Tags pushed before the setting was turned on were never processed in tag mode, so redeliver the newest matching tag from that page, or run `./manage.py import_website_starters https://github.com/mitodl/ocw-hugo-projects`, which reads the newest matching tag. Then check that a starter's configuration matches the file at that tag's commit. The next release exercises the webhook for real.
+
+#### Rolling back
+
+Setting `OCW_HUGO_TAG_RELEASES` back to `False` and re-upserting returns the pipelines to the `release-candidate` and `release` branches. Those branches no longer advance once the repos are released as tags, so they hold the last release made before the switch, and rolling back means running that older code. Fix forward with a new tag where you can.
+
+# Enabling GitHub integration
+
+You can enable git integration so that website content will be synced with GitHub:
+
+- Create an organization within Github
+- Create a Github personal access token, with all `repo` permissions
+- Add the following to your .env file:
+  ```
+  CONTENT_SYNC_BACKEND=content_sync.backends.github.GithubBackend
+  GIT_ORGANIZATION=<your_organization>
+  ```
+- If you need to use a custom git domain, add `GIT_API_URL=<your_domain>/api/v3`
+- If you would like git commits to be anonymized, add `FEATURE_GIT_ANONYMOUS_COMMITS=True`
+
+You will also need authenticate using either a personal access token or via a github app.
+Both options have a base rate limit of 5K/hour, but a github app will allow for an additional
+50/hr for each repo in your organization if you have at least 20 repos.
+
+If you wish to authenticate using a personal access token, create one in Github then set the following
+in your .env file:
+
+```
+GIT_TOKEN=<your_token>
+```
+
+If you wish to use a github app,
+[create one for your organization](https://docs.github.com/en/developers/apps/building-github-apps/creating-a-github-app):
+
+- The homepage url can be anything
+- You do not need a callback url or webhook url (disable webhooks)
+- For Repository Permissions, choose "read/write" permission for "Administration", "Contents", "Pull Requests", "Commit Statuses"
+- After it is created, add the "App ID" to your .env file:
+  ```
+  GITHUB_APP_ID=<app id>
+  ```
+- Generate a private key. A pem file will download. You need to use the content of this file in your .env file:
+  ```
+  GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\nMIIEpQ......\n-----END RSA PRIVATE KEY-----
+  ```
+- Install the app (follow instructions in link above) to your organization for "All repositories"
+
+# Local S3 emulation with Minio
+
+Our `docker-compose` configuration includes an instance of [Minio](https://github.com/minio/minio) which emulates Amazon's S3 service locally.
+This works in conjunction with the `ENVIRONMENT` env variable being set to "dev." When this is set, usage of the `boto3` library will automatically
+set `endpoint_url` to the internal Docker IP address of the Minio instance. You will need a few env variables:
+
+```python
+MINIO_ROOT_USER=minio_user
+MINIO_ROOT_PASSWORD=minio_password
+AWS_ACCESS_KEY_ID=minio_user
+AWS_SECRET_ACCESS_KEY=minio_password
+AWS_STORAGE_BUCKET_NAME=ol-ocw-studio-app
+AWS_PREVIEW_BUCKET_NAME=ocw-content-draft
+AWS_PUBLISH_BUCKET_NAME=ocw-content-live
+AWS_TEST_BUCKET_NAME=ocw-content-test
+AWS_OFFLINE_PREVIEW_BUCKET_NAME=ocw-content-offline-draft
+AWS_OFFLINE_PUBLISH_BUCKET_NAME=ocw-content-offline-live
+AWS_OFFLINE_TEST_BUCKET_NAME=ocw-content-offline-test
+AWS_ARTIFACTS_BUCKET_NAME=ol-eng-artifacts
+OCW_HUGO_THEMES_BRANCH=main
+OCW_HUGO_PROJECTS_BRANCH=main
+STATIC_API_BASE_URL=https://ocw.mit.edu
+RESOURCE_BASE_URL_DRAFT=https://draft.ocw.mit.edu
+RESOURCE_BASE_URL_LIVE=https://ocw.mit.edu
+```
+
+Notice how `MINIO_ROOT_USER` is the same value as `AWS_ACCESS_KEY_ID` and `MINIO_ROOT_PASSWORD` is the same as `AWS_SECRET_ACCESS_KEY`. This is to
+ensure that the Minio server is initialized with the same access keys that `ocw-studio` is using. The rest of the AWS bucket name keys are the same
+as a standard AWS configuration. the `RESOURCE_BASE_URL` keys are for use with the Concourse container. When using Minio in conjunction with Concourse
+and running any of the management commands that upsert pipelines, these values will be used for the `RESOURCE_BASE_URL` env variable when building sites.
+
+In sites that support resource upload, you should be able to upload anything except videos to Google Drive using the RC Google Drive credentials, then
+in your site click "Sync w/ Google Drive." If you visit http://localhost:9001 in your web browser, you should be brought to the Minio control panel.
+You can log into this with whatever you set `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` to. Inside, you should be able to browse the files you uploaded
+to the bucket. Videos are not currently supported locally beacuse of the transcoding service that is normally used with this. The preview and publish
+buckets are exposed via nginx locally at http://localhost:8044 and http://localhost:8045 respectively.
+
+In order to complete your local development setup, you will need to follow the instructions below to configure a Concourse Docker container so you
+can run pipelines and have them push their output to your Minio S3 buckets. The `OCW_HUGO_THEMES_BRANCH` and `OCW_HUGO_PROJECTS_BRANCH` settings will
+control the branch of each of these repos that are pulled down in pipelines that build sites. If you are debugging an issue with a specific branch,
+This is where you want to change them before you run a command that pushes up a pipeline like `docker-compose exec web ./manage.py backpopulate_pipelines --filter etc...`
+
+Note that you may also want to set `OCW_STUDIO_DRAFT_URL=https://localhost:8044`and `OCW_STUDIO_LIVE_URL=http://localhost:8045` in your `.env` file
+so that the URLs in the publish drawer will point to your Minio published content. If you do this, you will likely need to also set `STATIC_API_BASE_URL_DRAFT=https://draft.ocw.mit.edu`
+and `STATIC_API_BASE_URL_LIVE=https://ocw.mit.edu`. Usually the best way to get started getting content into your local instance of `ocw-studio` is to dump
+and restore the production database to your local instance. One side effect of doing this is that the `ocw-www` site in production has a bunch of different sites linked
+to it via various course lists. When building `ocw-www`, Hugo will attempt to fetch static JSON data related to these linked courses and will encounter errors if it cannot
+fetch them. To avoid this, make sure `STATIC_API_BASE_URL_DRAFT` and `STATIC_API_BASE_URL_LIVE` are set as detailed above. If `STATIC_API_BASE_URL` is not set,
+it will fall back to `OCW_STUDIO_DRAFT_URL` or `OCW_STUDIO_LIVE_URL` depending on the context of the pipeline. So, if you have this set to a URL where the courses
+referenced in your `ocw-www` site's course lists haven't been published, you will have issues.
+
+# Enabling Concourse-CI integration
+
+Concourse-CI integration is enabled by default to create and trigger publishing pipelines, but you
+will need to follow some additional steps before it is fully functional.
+
+- Set up Github integration as described above
+- Set up a Concourse-CI instance with a team, username, and password
+- Add the following to your .env file:
+
+  ```
+  AWS_PREVIEW_BUCKET_NAME=<S3 bucket for draft content>
+  AWS_PUBLISH_BUCKET_NAME=<S3 bucket for live content>
+  GIT_DOMAIN=<root domain for github repos, ie github.com>
+  ROOT_WEBSITE_NAME=<Website.name for the website that should be the 'home page'>
+
+  CONCOURSE_URL=<The URL of your Concourse-CI instance>
+  CONCOURSE_TEAM=<Concourse-CI team, defaults to "ocw">
+  CONCOURSE_USERNAME=<Concourse-CI username>
+  CONCOURSE_PASSWORD=<Concourse-CI password>
+  CONCOURSE_IS_PRIVATE_REPO=<True if repo is private, False otherwise>
+  API_BEARER_TOKEN=<some hard to guess string>
+  ```
+
+- Draft and live pipelines should then be created for every new `Website` based on a `WebsiteStarter` with `source=github` and a valid github `path`.
+- There are also several management commands for Concourse-CI pipelines:
+  - `backpopulate_pipelines`: to create/update pipelines for all or some existing `Websites` (filters available)
+  - `trigger_pipelines <version>`: to manually trigger the draft or live pipeline for all or some existing `Websites` (filters available)
+- If you wish to disable concourse integration, set `CONTENT_SYNC_PIPELINE_BACKEND=` in your .env file.
+
+### Running a Local Concourse Docker Container
+
+You will need to set the following .env variables for the concourse Docker container:
+
+```python
+CONCOURSE_URL=http://concourse:8080
+CONCOURSE_PASSWORD=test
+CONCOURSE_USERNAME=test
+CONCOURSE_TEAM=main
+```
+
+When you spin up `ocw-studio` with `docker-compose up`, the Concourse container will come up with everything else.
+The concourse UI will be available for login at http://concourse:8080 (You should add `127.0.0.1 concourse` to your hosts file.)
+When you create a new website or run one of the various management commands that push pipelines up to Concourse, they will go to
+your local instance instead. The pipeline templates with the `-dev` suffix are used when `settings.ENVIRONMENT` is set to "dev."
+
+When you click publish on a site, the pipelines in your local instance of Concourse will be triggered. If you set up Minio as
+detailed above, the pipelines will publish their output to your locally-running S3 buckets inside it. As also described above,
+you can view the output of your sites at http://localhost:8044 and http://localhost:8045 for draft and live respectively. You will
+need to also make sure you run `docker-compose exec web ./manage.py upsert_theme_assets_pipeline` to push up the theme assets
+pipeline to your local Concourse instance. You will then need to log into Concourse, unpause the pipeline and start a run of it.
+This will place theme assets into the bucket you have configured at `AWS_ARTIFACTS_BUCKET_NAME` that your site pipelines can
+reference. If you have already-existing sites that don't have their pipelines pushed up into your local Concourse yet, you will
+need to run `docker-compose exec web ./manage.py backpopulate_pipelines` and use the `--filter` or `--filter-json` arguments to
+specify the sites to push up pipelines for. The mass build sites pipeline can be pushed up with `docker-compose exec web ./manage.py upsert_mass_build_pipeline`.
+Beware that when testing the mass build pipeline locally, you will likely need to limit the amount of sites in your local instance
+as using only one dockerized worker publishing the entire OCW site will take a very long time.
+
+### End to end testing of site pipelines
+
+There is a pipeline definition for end to end testing of sites using the `ocw-www` and `ocw-course` starters. It can be run locally in Concourse using the following steps to set it up.
+
+Firstly, there are some environment variables you will want to set:
+
+```
+OCW_TEST_SITE_SLUGS=["ocw-ci-test-www", "ocw-ci-test-course"]
+AWS_TEST_BUCKET_NAME=ocw-content-test
+AWS_OFFLINE_TEST_BUCKET_NAME=ocw-content-offline-test
+STATIC_API_BASE_URL_TEST=http://10.1.0.102:8046
+```
+
+If you are running on Apple Silicon (arm64), you should also set:
+
+```
+PLAYWRIGHT_IMAGE_ARCH=amd64
+```
+
+This ensures the e2e test pipeline uses an explicit `amd64` Playwright image so it can run the `x86_64` `hugo-bin-extended` binary used in the end-to-end test.
+
+There are fixtures for two test websites in the `test_site_fixtures` folder. These contain two sites; `ocw-ci-test-www` and `ocw-ci-test-course` along with test content. In `test_websites.json`, the IDs of the `ocw-www` and `ocw-course` starters are referenced. If these IDs are not correct on your system, you can get the IDs of your starters in Django admin and modify the fixture. They can be loaded into the database with the following commands:
+
+```
+docker-compose exec web ./manage.py loaddata test_site_fixtures/test_websites.json
+docker-compose exec web ./manage.py loaddata test_site_fixtures/test_website_content.json
+```
+
+Once the test sites are in your database, you will need to get them up to your Github org. The easiest way to do this is to run the following commands:
+
+```
+docker-compose exec web ./manage.py reset_sync_states --filter "ocw-ci-test-www, ocw-ci-test-course" --skip_sync
+docker-compose exec web ./manage.py sync_website_to_backend --filter "ocw-ci-test-www, ocw-ci-test-course" --user <studio-user-email>
+```
+
+Use the email address of your active Studio account for `--user` when syncing. Manual sync commits are attributed to that account.
+
+At this point, you should be able to see the test sites in your Github org and the content should be on the `main` branch. In order to get the content up into the `release` branch, you will need to click the publish button on both sites:
+
+http://localhost:8043/sites/ocw-ci-test-www
+http://localhost:8043/sites/ocw-ci-test-course
+
+Publishing of the sites will fail because of missing fixtures, but that doesn't matter. All you need to run the end to end testing pipelines is for the content to be in the `release` branch in Github. The last prerequisite you need to set up is to load the static assets into Minio:
+
+- Download the contents of this Google Drive folder: https://drive.google.com/drive/folders/14Hlid31Qy7Yy5V4OgHUwNleYUFuJ5BH2?usp=sharing
+- Browse to the Minio web UI at http://localhost:9001 and log in with your credentials
+- Browse to the `ol-ocw-studio-app` bucket, go to the `courses` folder and create a folder here called `ocw-ci-test-course`
+- In this folder, upload the files you downloaded from Google Drive
+
+You are now ready to push up the test pipeline to Concourse, which can be done by running:
+
+```
+docker-compose exec web ./manage.py upsert_e2e_test_pipeline --themes-branch main --projects-branch main
+```
+
+You can alter the themes branch and projects branches to suit your needs if you are testing a different branch of `ocw-hugo-themes` or `ocw-hugo-projects`. Keep in mind that for any branch of `ocw-hugo-themes` you use, you will need to have built theme assets in Minio. You'll need to run the `upsert_theme_assets` pipeline for that branch and then run it.
+
+You should now have a pipeline in Concourse called `e2e-test-pipeline`. Run this pipeline and it will:
+
+- Pull down all the necessary git repos
+- Build the test sites
+- Deploy them to Minio
+- Run Playwright tests against the output
+
+### Publish And Build Dates
+
+- Publishing the site from Studio for live and draft versions updates the website properties `(live_build_date, publish_date)` and `(draft_build_date, draft_publish_date)`, respectively.
+- Running the mass build for live and draft versions only updates the website properties `live_build_date` and `draft_build_date`, respectively.
+
+# Video Workflow
+
+The video workflow for OCW is [described here](/videos/README.md). Note that YouTube integration, Google Drive integration, AWS transcoding, and 3Play integration all need to be set up for the video workflow to work properly. These are described next.
+
+# Enabling YouTube integration
+
+_Note: The steps below describe the process for setting up YouTube integration from scratch. MIT OL Engineers may use YouTube credentials from RC as an acceptable, easier alternative._
+
+- Create a new project at https://console.cloud.google.com/apis/dashboard
+  - Save the project ID in your `.env` file as `YT_PROJECT_ID`
+- Create an OAuth client ID for the project (type: `Web application`)
+  - Add an authorized JavaScript origin (ie `https://<your_domain>/`)
+  - Add an authorized redirect URI: `https://<your_domain>/api/youtube-tokens/`
+  - You may need to create an oauth consent screen if prompted; make sure to publish it.
+  - Save your client ID and client secret in your `.env` file (as `YT_CLIENT_ID` and `YT_CLIENT_SECRET`)
+- Enable the YouTube Data API v3 for your project
+- Go to `https://<your_domain>/api/youtube-tokens/`.
+- You should be prompted to choose a Google account. Choose an account that has upload permissions for your Youtube channel.
+- You will then be prompted to choose an account or brand account. Choose whichever is appropriate.
+- After clicking through these and allowing any requested permissions, you should be redirected back to an API response containing values for YT_ACCESS_TOKEN and YT_REFRESH_TOKEN. Add these to your .env file.
+
+# Enabling Google Drive integration
+
+With Google Drive integration enabled, a folder on the specified Team Drive will be created for each new website.
+The folder will have the same name as the `short_id` of the website. Under this folder will be 3 subfolders:
+`files`, `files_final`, `videos_final`. Videos should be uploaded to `videos_final`; everything else should be uploaded
+to `files_final`. The `files` folder is just for temporary storage.
+
+If this integration is enabled, manual resource creation and file uploads will no longer be possible. Files must
+be uploaded to Google Drive first, and then the "Sync w/Google Drive" button will import and create resources for them.
+
+- Add the following to your .env file:
+
+  ```
+  AWS_STORAGE_BUCKET_NAME=The S3 bucket to upload Google Drive files to. Also populate AWS authentication settings.
+  DRIVE_SHARED_ID=The id of your Google Team Drive
+  DRIVE_SERVICE_ACCOUNT_CREDS=The required Google service account credentials in JSON format.
+  DRIVE_UPLOADS_PARENT_FOLDER_ID=Optional, the folder id in the team drive where course folders should go.
+  ```
+
+- If your site configuration for resources has a non-standard field name for type, add the following to your .env file:
+  ```
+  RESOURCE_TYPE_FIELDS=resourcetype,filetype,<your_custom_field_name>
+  ```
+
+_Note: MIT OL Engineers may use Google Drive credentials from RC as an alternative to creating their own Google Drive folders._
+
+# Enabling AWS MediaConvert transcoding
+
+The following environment variables need to be defined in your .env file:
+
+```
+AWS_ACCOUNT_ID
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+AWS_STORAGE_BUCKET_NAME
+VIDEO_S3_TRANSCODE_ENDPOINT
+AWS_ROLE_NAME
+DRIVE_SHARED_ID
+DRIVE_SERVICE_ACCOUNT_CREDS
+API_BEARER_TOKEN
+```
+
+This will allow for videos to be submitted for transcoding to the AWS MediaConvert service. This is done automatically once a video has been synced to Studio from Google Drive.
+
+# Enabling 3Play integration
+
+The following environment variables need to be defined in your .env file (for a pre-configured 3Play account):
+
+```
+THREEPLAY_API_KEY
+THREEPLAY_CALLBACK_KEY
+THREEPLAY_PROJECT_ID
+```
+
+# Enabling Open Catalog Search Webhooks
+
+The following environment variables need to be defined in your .env file in order to notify external course catalogs like MIT Open when OCW sites are created/updated.
+
+```
+OPEN_CATALOG_URLS=delimited list of api endpoint urls that webhooks should be sent to
+OPEN_CATALOG_WEBHOOK_KEY=secret key that will be used to confirm that webhook requests are legitimate
+```
+
+# Checking External Resource Availability
+
+This feature sets up a cron job to validate external resource urls. The workflow for checking external resource availability is described [here](/external_resources/README.md).
+
+# Enabling PostHog Integration
+
+PostHog is used for dynamically testing and rolling out features that may not be ready for permanent deployment as part of OCW Studio. For example, we use the feature flag `OCW_STUDIO_CONTENT_DELETABLE` to control whether content can be deleted.
+
+The following delimited list should be set in `.env` file to allow which type of content can be deleted:
+
+```
+OCW_STUDIO_DELETABLE_CONTENT_TYPES=external-resource,instructor,page
+```
+
+The following variables should be set in the `.env` file for PostHog integration:
+
+```
+POSTHOG_ENABLED=True
+POSTHOG_API_HOST=https://app.posthog.com
+POSTHOG_PROJECT_API_KEY=<obtain from the PostHog dashboard>
+```
+
+The following variables can be optionally set to configure PostHog requests:
+
+```
+POSTHOG_FEATURE_FLAG_REQUEST_TIMEOUT_MS=<3000 by default>
+POSTHOG_MAX_RETRIES=<3 by default>
+```
+
+# Cloning Production Data
+
+For information on duplicating OCW Studio data from production for local development, see the [Production to Local Data Cloning Guide](docs/production-to-local-data-cloning.md).
+
+For information on duplicating OCW Studio data from production to RC/staging environments, see the [Production to RC Data Cloning Guide](docs/production-to-rc-data-cloning.md).

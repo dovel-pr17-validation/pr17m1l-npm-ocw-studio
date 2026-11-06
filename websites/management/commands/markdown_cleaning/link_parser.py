@@ -1,0 +1,237 @@
+from dataclasses import dataclass
+from typing import Protocol, Union
+
+from pyparsing import (
+    CharsNotIn,
+    Combine,
+    FollowedBy,
+    Literal,
+    Optional,
+    ParserElement,
+    ParseResults,
+    StringEnd,
+    White,
+    Word,
+    ZeroOrMore,
+    nested_expr,
+    original_text_for,
+    quotedString,
+)
+
+from websites.management.commands.markdown_cleaning.parsing_utils import (
+    WrappedParser,
+    escape_double_quotes,
+    restore_initial_default_whitespace_chars,
+    unescape_quoted_string,
+)
+
+# Characters that must never be silently absorbed into a link destination:
+# space/tab (existing separator logic), ASCII control characters (Go's
+# net/url.Parse rejects these outright with "invalid control character in
+# URL"), and backslash (Go's net/url.Parse rejects it specifically with
+# "invalid character \"\\\\\" in host name"). A source markdown link with one
+# of these inside its `(destination)` most likely comes from a hard-wrapped
+# or otherwise mangled URL, not a deliberate one.
+_DESTINATION_FORBIDDEN_CHARS = (
+    " " + "".join(chr(c) for c in range(0x20)) + "\x7f" + "\\"
+)
+
+
+@dataclass
+class MarkdownLink:
+    """
+    Representation of a markdown link OR image.
+    """
+
+    text: str
+    destination: str
+    is_image: bool = False
+    title: str = ""
+
+    # Tuple of tuples (ParseResults, start_index, end_index) where
+    # - ParseResult has named tokens
+    #       - link: MarkdownLinkOrImage
+    #       - original_text: str
+    # - start_index, end_index are the start/end of this link within self.text
+    text_links: Union[tuple, None] = None
+
+    def to_markdown(self):
+        """Generate markdown representation of this link/image."""
+        prefix = "!" if self.is_image else ""
+        title_suffix = f' "{escape_double_quotes(self.title)}"' if self.title else ""
+        return f"{prefix}[{self.text}]({self.destination}{title_suffix})"
+
+
+class LinkParseResult(Protocol):
+    link: MarkdownLink
+    original_text: str
+
+
+class LinkParser(WrappedParser):
+    r"""
+    Parser for markdown links and images.
+
+    Why bother?
+    ===========
+
+    Consider a naive regex appraoch:
+
+    >>> import re
+    >>> link = re.compile(r'\[(?P<text>.*?)\]\(?<dest>.*?\)')
+    >>> first = link.search('See [Reference 1] blah balh [some text](url)')
+    >>> first.group('text')
+    'Reference 1] blah balh [some text'
+
+    Way too much text has been captured.
+
+    Of course, we can forbid the `text` group from containing square brackets.
+    But then we won't match links whose titles contain square brackets! Markdown
+    link text (in CommonMark) is allowed to contain any sequence of balanced
+    square brackets, something regex simply can't handle.
+
+    So to robustly parse Markdown links, we can't use regex.
+
+    Speaking of CommonMark: (https://spec.commonmark.org/0.30/#links)
+    The link spec has lots of edge cases. This parser is not fully compliant.
+    For example, the grammar does not allow "at most one line end character" in
+    the separator between link destination and link title, nor is the
+    angle-bracket destination variant treated properly.
+    """
+
+    def __init__(self, recursive=False):  # noqa: FBT002
+        # By default pyparsing collapses whitespace characters.
+        # Markdown cares about whitespace containing double newlines, so we
+        # can't collapse newlines.
+        ParserElement.set_default_whitespace_chars("")
+        grammar = (
+            self._parser_piece_is_image()
+            + self._parser_piece_text()
+            + self._parser_piece_destination_and_title()
+        )
+
+        def parse_action(_s, _l, toks):
+            token = toks
+            is_image = token.is_image
+            title = token.title
+            text = token.text
+            destination = token.destination
+
+            # Use self.scan_string not grammar.scan_string
+            # so that parse actions attached to LinkParser fire for the nested
+            # links, which seems desirable.
+            text_links = tuple(self.scan_string(text)) if recursive else None
+
+            link = MarkdownLink(
+                text=text,
+                destination=destination,
+                title=title,
+                is_image=is_image,
+                text_links=text_links,
+            )
+
+            return ParseResults.from_dict({"link": link})
+
+        grammar.set_parse_action(parse_action)
+
+        restore_initial_default_whitespace_chars()
+
+        super().__init__(grammar)
+
+    @staticmethod
+    def _parser_piece_is_image():
+        """
+        Return PyParsing element to match an optional ! at beginning of links
+        to indicate that the link is actually an image.
+        """
+        return (
+            Optional("!")
+            .set_results_name("is_image")
+            .set_parse_action(lambda s, l, toks: bool(toks))  # noqa: ARG005, E741
+        )
+
+    @staticmethod
+    def _parser_piece_text():
+        """
+        Return PyParsing element to the text of a markdown link.
+        """
+        # No double line breaks in markdown links
+        double_line_break = (
+            Word("\n\r", exact=1) + Optional(Word(" \t")) + Word("\n\r", exact=1)
+        )
+
+        # We will ignore escaped square brackets when match finding balanced
+        # square brackets.
+        ignore = Literal("\\[") | Literal("\\]")
+
+        # The text parser will match text inside balanced brackets using the
+        # nestedExpr helper function from PyParsing.
+        #
+        # Next we define the content that is allowed inside the brackets.
+        content_character = ~FollowedBy(double_line_break) + CharsNotIn("[]", exact=1)
+        # Normally with nestedExpr, the content parser would be separately applied
+        # to each whitespace-separated string within the nested expression.
+        # However, since we set whitespaceChars to '', the content parser is
+        # applied to characters one-at-a-time.
+        #
+        # If this ever changes, we would need to change content to something
+        # like Combine(OneOrMore(~ignore + content_character))
+        content = content_character
+        text = original_text_for(
+            nested_expr(
+                opener="[",
+                closer="]",
+                content=content,
+                ignore_expr=ignore,
+            )
+        ).set_results_name("text")
+
+        text.add_parse_action(lambda s, l, toks: toks[0][1:-1])  # noqa: ARG005, E741
+
+        return text
+
+    @staticmethod
+    def _parser_piece_destination_and_title():
+        """
+        Return PyParsing element to match the destination and title of a
+        markdown link.
+        """
+
+        # Capture everything between the balanced parentheses
+        # Then parse it later.
+        dest_and_title = original_text_for(
+            nested_expr(opener="(", closer=")")
+        ).add_parse_action(
+            lambda s, l, toks: toks[0][1:-1]  # noqa: ARG005, E741
+        )
+
+        destination = Combine(
+            # Zero or more non-space characters.
+            # But before each character (exact=1) check if we have a
+            # shortcode. If we do, allow that.
+            ZeroOrMore(
+                original_text_for(nested_expr(opener=R"{{<", closer=">}}"))
+                | original_text_for(nested_expr(opener=R"{{%", closer="%}}"))
+                | CharsNotIn(_DESTINATION_FORBIDDEN_CHARS, exact=1)
+            )
+        ).set_results_name("destination")
+
+        # CommonMark requires link title to be encased in single-quotes,
+        # double-quotes, or wrapped in parentheses. Let's not bother with
+        # the parentheses case for now.
+        title = (
+            quotedString.copy()
+            .set_results_name("title")
+            .set_parse_action(
+                lambda s, l, toks: unescape_quoted_string(toks[0])  # noqa: ARG005, E741
+            )
+        )
+
+        # This will parse the contents of dest_and_title
+        dest_and_title_parser = destination + Optional(White(" ") + title) + StringEnd()
+
+        def back_parse_action(_s, _l, toks):
+            return dest_and_title_parser.parse_string(toks[0])
+
+        dest_and_title.add_parse_action(back_parse_action)
+
+        return dest_and_title

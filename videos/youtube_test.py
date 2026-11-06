@@ -1,0 +1,924 @@
+"""
+Tests for youtube api
+"""
+
+import random
+import string
+from types import SimpleNamespace
+
+import pytest
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
+from googleapiclient.errors import HttpError
+
+from content_sync.constants import VERSION_DRAFT, VERSION_LIVE
+from users.factories import UserFactory
+from videos.conftest import MockHttpErrorResponse
+from videos.constants import (
+    DESTINATION_YOUTUBE,
+    YT_MAX_LENGTH_DESCRIPTION,
+    YT_MAX_LENGTH_TITLE,
+)
+from videos.factories import VideoFactory, VideoFileFactory
+from videos.messages import YouTubeUploadFailureMessage, YouTubeUploadSuccessMessage
+from videos.utils import get_course_tag, parse_tags
+from videos.youtube import (
+    CAPTION_UPLOAD_NAME,
+    YouTubeApi,
+    YouTubeUploadException,
+    get_video_privacy_status,
+    mail_youtube_upload_failure,
+    mail_youtube_upload_success,
+    strip_bad_chars,
+    update_youtube_metadata,
+)
+from websites.constants import (
+    CONTENT_TYPE_RESOURCE,
+    RESOURCE_TYPE_IMAGE,
+    RESOURCE_TYPE_VIDEO,
+)
+from websites.factories import WebsiteContentFactory, WebsiteFactory
+from websites.models import WebsiteContent
+from websites.utils import set_dict_field
+
+pytestmark = pytest.mark.django_db
+
+# pylint: disable=redefined-outer-name,unused-argument,no-value-for-parameter,unused-variable
+
+
+@pytest.fixture
+def youtube_mocker(mocker):
+    """Return a mock YouTube api client"""
+    return mocker.patch("videos.youtube.build")
+
+
+@pytest.fixture
+def youtube_website(mocker):
+    """Return a website with YouTube resources"""
+    website = WebsiteFactory.create()
+    WebsiteContentFactory.create(
+        type=CONTENT_TYPE_RESOURCE,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_IMAGE,
+            "video_metadata": {"youtube_id": "fakeid"},
+        },
+    )
+    for youtube_id in ["", None, "abc123", "def456"]:
+        WebsiteContentFactory.create(
+            website=website,
+            type=CONTENT_TYPE_RESOURCE,
+            metadata={
+                "resourcetype": RESOURCE_TYPE_VIDEO,
+                "video_metadata": {"youtube_id": youtube_id},
+            },
+        )
+    return website
+
+
+@pytest.fixture
+def mock_mail(mocker):
+    """Objects and mocked functions for mail tests"""
+    mock_get_message_sender = mocker.patch("videos.youtube.get_message_sender")
+    mock_sender = mock_get_message_sender.return_value.__enter__.return_value
+    video_file = VideoFileFactory.create()
+    users = UserFactory.create_batch(4)
+    for user in users[:2]:
+        user.groups.add(video_file.video.website.admin_group)
+    for user in users[2:]:
+        user.groups.add(video_file.video.website.editor_group)
+    return SimpleNamespace(
+        mock_get_message_sender=mock_get_message_sender,
+        mock_sender=mock_sender,
+        video_file=video_file,
+        users=users,
+    )
+
+
+def test_youtube_settings(mocker, settings):
+    """
+    Test that YouTube object creation uses YT_* settings for credentials
+    """
+    settings.YT_ACCESS_TOKEN = "yt_access_token"  # noqa: S105
+    settings.YT_CLIENT_ID = "yt_client_id"
+    settings.YT_CLIENT_SECRET = "yt_secret"  # noqa: S105
+    settings.YT_REFRESH_TOKEN = "yt_refresh"  # noqa: S105
+    mock_oauth = mocker.patch("videos.youtube.Credentials")
+    YouTubeApi()
+    mock_oauth.assert_called_with(
+        settings.YT_ACCESS_TOKEN,
+        client_id=settings.YT_CLIENT_ID,
+        client_secret=settings.YT_CLIENT_SECRET,
+        refresh_token=settings.YT_REFRESH_TOKEN,
+        token_uri="https://accounts.google.com/o/oauth2/token",  # noqa: S106
+    )
+
+
+def test_upload_video(youtube_mocker):
+    """
+    Test that the upload_video task calls the YouTube API execute method
+    """
+    videofile = VideoFileFactory()
+    youtube_id = "M6LymW_8qVk"
+    video_upload_response = {
+        "id": youtube_id,
+        "kind": "youtube#video",
+        "snippet": {"description": "Testing description", "title": "Testing123"},
+        "status": {"uploadStatus": "uploaded"},
+    }
+    youtube_mocker().videos.return_value.insert.return_value.next_chunk.side_effect = [
+        (None, None),
+        (None, video_upload_response),
+    ]
+    response, _ = YouTubeApi().upload_video(videofile)
+    assert response == video_upload_response
+
+
+def test_upload_video_no_id(youtube_mocker):
+    """
+    Test that the upload_video task fails if the response contains no id
+    """
+    videofile = VideoFileFactory()
+    youtube_mocker().videos.return_value.insert.return_value.next_chunk.return_value = (
+        None,
+        {},
+    )
+    with pytest.raises(YouTubeUploadException):
+        YouTubeApi().upload_video(videofile)
+
+
+@pytest.mark.parametrize(
+    ("error", "retryable"),
+    [
+        [HttpError(MockHttpErrorResponse(500), b""), True],  # noqa: PT007
+        [HttpError(MockHttpErrorResponse(403), b""), False],  # noqa: PT007
+        [OSError, True],  # noqa: PT007
+        [IndexError, False],  # noqa: PT007
+    ],
+)
+def test_upload_errors_retryable(mocker, youtube_mocker, error, retryable):
+    """
+    Test that uploads are retried 10x for retryable exceptions
+    """
+    mocker.patch("videos.youtube.time")
+    videofile = VideoFileFactory()
+    youtube_mocker().videos.return_value.insert.return_value.next_chunk.side_effect = (
+        error
+    )
+    with pytest.raises(Exception) as exc:  # noqa: PT011
+        YouTubeApi().upload_video(videofile)
+    assert str(exc.value).startswith("Retried YouTube upload 10x") == retryable
+
+
+def test_upload_video_long_fields(mocker, youtube_mocker):
+    """
+    Test that the upload_youtube_video task truncates title and description if too long
+    and includes course slug as tag
+    """
+    name = "".join(random.choice(string.ascii_lowercase) for c in range(105))  # noqa: S311
+    video_file = VideoFileFactory.create()
+    video_file.video.source_key = video_file.s3_key.replace("file_", name)
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+    YouTubeApi().upload_video(video_file)
+    _called_args, called_kwargs = mock_upload.call_args
+    assert called_kwargs["body"]["snippet"]["title"] == f"{name[:97]}..."
+    # Verify course slug is included as tag
+    course_slug = get_course_tag(video_file.video.website)
+    assert called_kwargs["body"]["snippet"]["tags"] == course_slug
+
+
+@pytest.mark.parametrize("notify", [True, False])
+def test_upload_notify_subscribers(mocker, youtube_mocker, notify):
+    """
+    Test that the upload_youtube_video task appropriately sets notifySubscribers
+    """
+    name = "".join(random.choice(string.ascii_lowercase) for c in range(50))  # noqa: S311
+    video_file = VideoFileFactory.create()
+    video_file.video.source_key = video_file.s3_key.replace("file_", name)
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+    YouTubeApi().upload_video(video_file, notify_subscribers=notify)
+    _called_args, called_kwargs = mock_upload.call_args
+    assert called_kwargs["notifySubscribers"] is notify
+
+
+def test_upload_video_prevents_duplicate_course_tag(mocker, youtube_mocker):
+    """
+    Test that upload_video doesn't add duplicate course tag if it already exists in existing_tags.
+    """
+    video_file = VideoFileFactory.create()
+    course_slug = get_course_tag(video_file.video.website)
+
+    # existing_tags already contains the course slug in different case
+    existing_tags_with_course = f"Python, Django, {course_slug.upper()}"
+
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+
+    YouTubeApi().upload_video(video_file, existing_tags=existing_tags_with_course)
+
+    _, called_kwargs = mock_upload.call_args
+
+    # Verify the course tag appears only once in the final tags
+    final_tags = called_kwargs["body"]["snippet"]["tags"]
+    tag_list = parse_tags(final_tags)
+
+    # Count occurrences of normalized course_slug
+    normalized_course_slug = course_slug.lower()
+    course_tag_count = tag_list.count(normalized_course_slug)
+    assert course_tag_count == 1, (
+        f"Course tag '{normalized_course_slug}' should appear exactly once, but appears {course_tag_count} times"
+    )
+
+    # Verify tags are sorted alphabetically
+    assert tag_list == sorted(tag_list)
+
+
+def test_upload_video_handles_duplicate_tags_in_existing(mocker, youtube_mocker):
+    """
+    Test that upload_video handles duplicate tags within existing_tags properly.
+    """
+    video_file = VideoFileFactory.create()
+    course_slug = get_course_tag(video_file.video.website)
+
+    # existing_tags has duplicate tags in different cases and with whitespace
+    existing_tags = "Python, django, PYTHON,  AI  , Django"
+
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+
+    YouTubeApi().upload_video(video_file, existing_tags=existing_tags)
+
+    _, called_kwargs = mock_upload.call_args
+
+    # Verify tags are sent to YouTube
+    final_tags = called_kwargs["body"]["snippet"]["tags"]
+    tag_list = parse_tags(final_tags)
+
+    # Verify course tag was added (normalized)
+    normalized_course_slug = course_slug.lower()
+    assert normalized_course_slug in tag_list
+
+    # Verify duplicates were removed (case-insensitive)
+    assert tag_list.count("python") == 1
+    assert tag_list.count("django") == 1
+    assert tag_list.count("ai") == 1
+
+    # Verify tags are sorted alphabetically
+    assert tag_list == sorted(tag_list)
+
+
+def test_upload_video_normalizes_all_tags(mocker, youtube_mocker):
+    """
+    Test that upload_video normalizes all tags (lowercase, strip whitespace).
+    """
+    video_file = VideoFileFactory.create()
+    course_slug = get_course_tag(video_file.video.website)
+
+    # existing_tags with mixed case and whitespace
+    existing_tags = "  Machine Learning  , Deep-LEARNING, AI  "
+
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+
+    YouTubeApi().upload_video(video_file, existing_tags=existing_tags)
+
+    _, called_kwargs = mock_upload.call_args
+
+    final_tags = called_kwargs["body"]["snippet"]["tags"]
+    tag_list = parse_tags(final_tags)
+
+    # All tags should be lowercase and sorted
+    expected_tags = sorted(
+        ["machine learning", "deep-learning", "ai", course_slug.lower()]
+    )
+    assert tag_list == expected_tags
+
+
+def test_upload_video_handles_no_existing_tags_only_course_slug(mocker, youtube_mocker):
+    """
+    Test that upload_video properly handles case where only course slug exists.
+    """
+    video_file = VideoFileFactory.create()
+    course_slug = get_course_tag(video_file.video.website)
+
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+
+    # No existing tags provided
+    YouTubeApi().upload_video(video_file, existing_tags=None)
+
+    _, called_kwargs = mock_upload.call_args
+
+    final_tags = called_kwargs["body"]["snippet"]["tags"]
+    tag_list = parse_tags(final_tags)
+
+    # Should only contain normalized course slug
+    assert tag_list == [course_slug.lower()]
+
+
+def test_upload_video_handles_existing_tags_no_course_slug(mocker, youtube_mocker):
+    """
+    Test that upload_video handles existing tags when website has no course slug.
+    """
+    video_file = VideoFileFactory.create()
+    # Mock get_course_tag to return None
+    mocker.patch("videos.youtube.get_course_tag", return_value=None)
+
+    existing_tags = "Python, Django, AI"
+
+    mocker.patch("videos.youtube.resumable_upload")
+    mock_upload = youtube_mocker().videos.return_value.insert
+
+    YouTubeApi().upload_video(video_file, existing_tags=existing_tags)
+
+    _, called_kwargs = mock_upload.call_args
+
+    final_tags = called_kwargs["body"]["snippet"]["tags"]
+    tag_list = parse_tags(final_tags)
+
+    # Should contain normalized existing tags (no course slug)
+    assert tag_list == ["ai", "django", "python"]
+
+
+@pytest.mark.parametrize("privacy", [None, "public"])
+def test_update_video(settings, mocker, youtube_mocker, privacy):
+    """update_video should send the correct data in a request to update YouTube metadata"""
+    speakers = "speaker1, speaker2"
+    tags = "tag1, tag2"
+    youtube_id = "test video description"
+    title = "TitleLngt>"
+    description = "DescLngth>"
+    content = WebsiteContentFactory.create(
+        title=" ".join([title for i in range(11)]),
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_description": " ".join([description for _ in range(501)]),
+                "youtube_id": youtube_id,
+                "video_tags": tags,
+                "video_speakers": speakers,
+            },
+        },
+    )
+
+    expected_title = f"{' '.join([title.replace('>', '') for _ in range(9)])}..."
+    expected_desc = f"{' '.join([description.replace('>', '') for _ in range(499)])}..."
+    # Course URL slug should be automatically added to tags (as a sorted list)
+    expected_tags = sorted(parse_tags(f"{tags}, {get_course_tag(content.website)}"))
+
+    assert len(content.title) > YT_MAX_LENGTH_TITLE
+    assert (
+        len(content.metadata["video_metadata"]["youtube_description"])
+        > YT_MAX_LENGTH_DESCRIPTION
+    )
+    assert len(expected_title) <= YT_MAX_LENGTH_TITLE
+    assert len(expected_desc) <= YT_MAX_LENGTH_DESCRIPTION
+
+    mock_update_caption = mocker.patch("videos.youtube.YouTubeApi.update_captions")
+
+    YouTubeApi().update_video(content, privacy=privacy)
+    youtube_mocker().videos.return_value.update.assert_any_call(
+        part="snippet",
+        body={
+            "id": youtube_id,
+            "snippet": {
+                "title": expected_title,
+                "description": expected_desc,
+                "tags": expected_tags,
+                "categoryId": settings.YT_CATEGORY_ID,
+            },
+        },
+    )
+    if privacy is not None:
+        youtube_mocker().videos.return_value.update.assert_any_call(
+            part="status",
+            body={
+                "id": youtube_id,
+                "status": {"privacyStatus": privacy, "embeddable": True},
+            },
+        )
+
+    mock_update_caption.assert_called_once_with(content, youtube_id)
+
+
+def test_update_video_prevents_duplicate_course_tag(settings, mocker, youtube_mocker):
+    """
+    Test that update_video doesn't add duplicate course tag if it already exists in video_tags.
+    """
+    course_slug = "test-course-fall-2020"
+    youtube_id = "test_video_update_dupes"
+
+    # Tags already include the course slug
+    tags_with_course = f"python, django, {course_slug}"
+
+    content = WebsiteContentFactory.create(
+        website__url_path=f"courses/{course_slug}",
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_description": "Test video description",
+                "youtube_id": youtube_id,
+                "video_tags": tags_with_course,
+            },
+        },
+    )
+
+    mocker.patch("videos.youtube.YouTubeApi.update_captions")
+
+    YouTubeApi().update_video(content)
+
+    # Get the tags that were sent in the update call
+    calls = youtube_mocker().videos.return_value.update.call_args_list
+    snippet_call = next(call for call in calls if call[1]["part"] == "snippet")
+    sent_tags = snippet_call[1]["body"]["snippet"]["tags"]
+
+    # Verify course tag appears only once
+    course_tag_count = sent_tags.count(course_slug)
+    assert course_tag_count == 1, (
+        f"Course tag '{course_slug}' should appear exactly once, but appears {course_tag_count} times"
+    )
+
+
+def test_update_video_tags(youtube_mocker):
+    """Test update_video_tags updates only tags for a YouTube video"""
+    youtube_id = "test_video_123"
+    new_tags = "python, django, machine-learning"
+
+    # Mock the list call to return current video data
+    current_snippet = {
+        "title": "Existing Title",
+        "description": "Existing description",
+        "tags": ["old-tag1", "old-tag2"],
+        "categoryId": "27",
+    }
+    youtube_mocker().videos.return_value.list.return_value.execute.return_value = {
+        "items": [{"snippet": current_snippet}]
+    }
+
+    YouTubeApi().update_video_tags(youtube_id, new_tags)
+
+    # Verify it fetched current video data
+    youtube_mocker().videos.return_value.list.assert_called_once_with(
+        part="snippet", id=youtube_id
+    )
+
+    # Verify it updated with modified tags
+    youtube_mocker().videos.return_value.update.assert_called_once()
+    update_call = youtube_mocker().videos.return_value.update.call_args
+
+    assert update_call[1]["part"] == "snippet"
+    assert update_call[1]["body"]["id"] == youtube_id
+    assert update_call[1]["body"]["snippet"]["tags"] == [
+        "python",
+        "django",
+        "machine-learning",
+    ]
+    # Verify other fields are preserved
+    assert update_call[1]["body"]["snippet"]["title"] == "Existing Title"
+    assert update_call[1]["body"]["snippet"]["description"] == "Existing description"
+
+
+def test_update_video_tags_not_found(youtube_mocker):
+    """Test update_video_tags raises exception when video not found"""
+    youtube_id = "nonexistent_video"
+
+    # Mock the list call to return empty items
+    youtube_mocker().videos.return_value.list.return_value.execute.return_value = {
+        "items": []
+    }
+
+    with pytest.raises(YouTubeUploadException, match=r"Video .* not found"):
+        YouTubeApi().update_video_tags(youtube_id, "test-tag")
+
+
+def test_video_status(youtube_mocker):
+    """
+    Test that the 'video_status' method returns the correct value from the API response
+    """
+    expected_status = "processed"
+    youtube_mocker().videos.return_value.list.return_value.execute.return_value = {
+        "etag": '"ld9biNPKjAjgjV7EZ4EKeEGrhao/Lf7oS5V-Gjw0XHBBKFJRpn60z3w"',
+        "items": [
+            {
+                "etag": '"ld9biNPKjAjgjV7EZ4EKeEGrhao/-UL82wRXbq3YJiMZuZpqCWKoq6Q"',
+                "id": "wAjoqsZng_M",
+                "kind": "youtube#video",
+                "status": {
+                    "embeddable": True,
+                    "license": "youtube",
+                    "privacyStatus": "unlisted",
+                    "publicStatsViewable": True,
+                    "uploadStatus": expected_status,
+                },
+            }
+        ],
+        "kind": "youtube#videoListResponse",
+        "pageInfo": {"resultsPerPage": 1, "totalResults": 1},
+    }
+    assert YouTubeApi().video_status("foo") == expected_status
+    youtube_mocker().videos.return_value.list.assert_called_once_with(
+        id="foo", part="status"
+    )
+
+
+def test_strip_bad_chars():
+    """
+    Test that `<`,`>` characters are removed from text
+    """
+    assert strip_bad_chars("<OV>S>") == "OVS"
+
+
+def test_mail_youtube_upload_failure(settings, mock_mail):
+    """Test that the appropriate mail functions are called with correct args"""
+    mail_youtube_upload_failure(mock_mail.video_file)
+    mock_mail.mock_get_message_sender.assert_called_once_with(
+        YouTubeUploadFailureMessage
+    )
+    assert (
+        mock_mail.mock_sender.build_and_send_message.call_count
+        == len(mock_mail.users) + 1
+    )
+    website = mock_mail.video_file.video.website
+    for collaborator in website.collaborators:
+        mock_mail.mock_sender.build_and_send_message.assert_any_call(
+            collaborator,
+            {
+                "site": {
+                    "title": website.title,
+                    "url": f"{settings.SITE_BASE_URL}sites/{website.name}",
+                },
+                "video": {
+                    "filename": mock_mail.video_file.video.source_key.split("/")[-1]
+                },
+            },
+        )
+
+
+def test_mail_youtube_upload_success(settings, mock_mail):
+    """Test that the appropriate mail functions are called with correct args"""
+    mail_youtube_upload_success(mock_mail.video_file)
+    mock_mail.mock_get_message_sender.assert_called_once_with(
+        YouTubeUploadSuccessMessage
+    )
+    assert (
+        mock_mail.mock_sender.build_and_send_message.call_count
+        == len(mock_mail.users) + 1
+    )
+    website = mock_mail.video_file.video.website
+    for collaborator in website.collaborators:
+        mock_mail.mock_sender.build_and_send_message.assert_any_call(
+            collaborator,
+            {
+                "site": {
+                    "title": website.title,
+                    "url": f"{settings.SITE_BASE_URL}sites/{website.name}",
+                },
+                "video": {
+                    "filename": mock_mail.video_file.video.source_key.split("/")[-1],
+                    "url": f"https://www.youtube.com/watch?v={mock_mail.video_file.destination_id}",
+                },
+            },
+        )
+
+
+def test_mail_youtube_upload_failure_exception_handling(mocker, mock_mail):
+    """Test that exceptions in mail_youtube_upload_failure are handled gracefully"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+    # Mock get_message_sender to raise an exception
+    mock_mail.mock_get_message_sender.side_effect = Exception("Email service error")
+
+    # This should not raise an exception
+    mail_youtube_upload_failure(mock_mail.video_file)
+
+    # Verify the exception was logged
+    mock_log.assert_called_once_with(
+        "Failed to send YouTube upload failure notification"
+    )
+
+
+def test_mail_youtube_upload_failure_collaborators_exception(mocker, mock_mail):
+    """Test exception handling when iterating over collaborators fails"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+
+    # Save the original collaborators property to restore later
+    website_collaboratores_original = type(
+        mock_mail.video_file.video.website
+    ).collaborators
+
+    # Mock the website.collaborators property to raise an exception
+    mock_collaborators = mocker.PropertyMock(
+        side_effect=Exception("Collaborators access error")
+    )
+    type(mock_mail.video_file.video.website).collaborators = mock_collaborators
+
+    # This should not raise an exception
+    mail_youtube_upload_failure(mock_mail.video_file)
+
+    # Verify the exception was logged
+    mock_log.assert_called_once_with(
+        "Failed to send YouTube upload failure notification"
+    )
+
+    # Clean up by restoring the original property
+    type(
+        mock_mail.video_file.video.website
+    ).collaborators = website_collaboratores_original
+
+
+def test_mail_youtube_upload_success_exception_handling(mocker, mock_mail):
+    """Test that exceptions in mail_youtube_upload_success are handled gracefully"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+    # Mock get_message_sender to raise an exception
+    mock_mail.mock_get_message_sender.side_effect = Exception("Email service error")
+
+    # This should not raise an exception
+    mail_youtube_upload_success(mock_mail.video_file)
+
+    # Verify the exception was logged
+    mock_log.assert_called_once_with(
+        "Failed to send YouTube upload success notification"
+    )
+
+
+def test_mail_youtube_upload_success_collaborators_exception(mocker, mock_mail):
+    """Test exception handling when iterating over collaborators fails"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+
+    # Save the original collaborators property to restore later
+    website_collaboratores_original = type(
+        mock_mail.video_file.video.website
+    ).collaborators
+
+    # Mock the website.collaborators property to raise an exception
+    mock_collaborators = mocker.PropertyMock(
+        side_effect=Exception("Collaborators access error")
+    )
+    type(mock_mail.video_file.video.website).collaborators = mock_collaborators
+
+    # This should not raise an exception
+    mail_youtube_upload_success(mock_mail.video_file)
+
+    # Verify the exception was logged
+    mock_log.assert_called_once_with(
+        "Failed to send YouTube upload success notification"
+    )
+
+    # Clean up by restoring the original property
+    type(
+        mock_mail.video_file.video.website
+    ).collaborators = website_collaboratores_original
+
+
+def test_mail_youtube_upload_success_sender_exception(mocker, mock_mail):
+    """Test exception handling when sender.build_and_send_message fails"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+    # Mock sender.build_and_send_message to raise an exception
+    mock_mail.mock_sender.build_and_send_message.side_effect = Exception(
+        "Send message error"
+    )
+
+    # This should not raise an exception
+    mail_youtube_upload_success(mock_mail.video_file)
+
+    # Verify the exception was logged
+    mock_log.assert_called_once_with(
+        "Failed to send YouTube upload success notification"
+    )
+
+
+def test_mail_youtube_upload_failure_sender_exception(mocker, mock_mail):
+    """Test exception handling when sender.build_and_send_message fails"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+    # Mock sender.build_and_send_message to raise an exception
+    mock_mail.mock_sender.build_and_send_message.side_effect = Exception(
+        "Send message error"
+    )
+
+    # This should not raise an exception
+    mail_youtube_upload_failure(mock_mail.video_file)
+
+    # Verify the exception was logged
+    mock_log.assert_called_once_with(
+        "Failed to send YouTube upload failure notification"
+    )
+
+
+@pytest.mark.parametrize(
+    ("res_draft", "expected_privacy"), [(True, None), (False, "public")]
+)
+@pytest.mark.parametrize("video_file_exists", [True, False])
+@pytest.mark.parametrize("youtube_enabled", [True, False])
+@pytest.mark.parametrize("is_ocw", [True, False])
+@pytest.mark.parametrize("previously_published", [True, False])
+@pytest.mark.parametrize(
+    ("version", "privacy"),
+    [[VERSION_DRAFT, "unlisted"], [VERSION_LIVE, "public"]],  # noqa: PT007
+)
+def test_update_youtube_metadata(  # pylint:disable=too-many-arguments  # noqa: PLR0913, PLR0917
+    mocker,
+    settings,
+    youtube_website,
+    video_file_exists,
+    youtube_enabled,
+    is_ocw,
+    version,
+    privacy,
+    res_draft,
+    expected_privacy,
+    previously_published,
+):
+    """Check that youtube.update_video is called for appropriate resources and not others"""
+    mock_youtube = mocker.patch("videos.youtube.YouTubeApi")
+    mock_update_video = mock_youtube.return_value.update_video
+    mocker.patch("videos.youtube.is_ocw_site", return_value=is_ocw)
+    mocker.patch("videos.youtube.is_youtube_enabled", return_value=youtube_enabled)
+    youtube_website.publish_date = timezone.now() if previously_published else None
+    youtube_website.unpublish_status = None
+    youtube_website.save()
+
+    for youtube_id in ["", None, "abc123", "def456"]:
+        if video_file_exists:
+            VideoFileFactory.create(
+                video=VideoFactory.create(website=youtube_website),
+                destination=DESTINATION_YOUTUBE,
+                destination_id=youtube_id,
+            )
+            content = WebsiteContent.objects.get(
+                website=youtube_website,
+                metadata__video_metadata__youtube_id=youtube_id,
+            )
+            set_dict_field(content.metadata, "draft", res_draft)
+            content.save()
+    update_youtube_metadata(youtube_website, version=version)
+    if youtube_enabled and is_ocw:
+        mock_youtube.assert_called_once()
+        # Don't update metadata for imported ocw course videos except on production
+        if video_file_exists:
+            assert mock_update_video.call_count == 2
+            for youtube_id in ["abc123", "def456"]:
+                final_privacy = get_video_privacy_status(
+                    version=version,
+                    is_draft=res_draft,
+                    previously_published=previously_published,
+                )
+
+                mock_update_video.assert_any_call(
+                    WebsiteContent.objects.get(
+                        website=youtube_website,
+                        metadata__video_metadata__youtube_id=youtube_id,
+                    ),
+                    privacy=final_privacy,
+                )
+        else:
+            mock_update_video.assert_not_called()
+    else:
+        mock_update_video.assert_not_called()
+
+
+def test_update_youtube_metadata_error(mocker, youtube_website):
+    """Log any error and move on"""
+    mock_log = mocker.patch("videos.youtube.log.exception")
+    mock_youtube = mocker.patch("videos.youtube.YouTubeApi")
+    mock_youtube.return_value.update_video = mocker.Mock(
+        side_effect=Exception("generic exception")
+    )
+    mocker.patch("videos.youtube.is_ocw_site", return_value=True)
+    mocker.patch("videos.youtube.is_youtube_enabled", return_value=True)
+    VideoFileFactory.create(
+        video=VideoFactory.create(website=youtube_website),
+        destination=DESTINATION_YOUTUBE,
+        destination_id="abc123",
+    )
+    update_youtube_metadata(youtube_website, version=VERSION_DRAFT)
+    mock_log.assert_any_call(
+        "Unexpected error updating metadata for video resource %d", mocker.ANY
+    )
+
+
+def test_update_youtube_metadata_no_videos(mocker):
+    """Youtube API should not be instantiated if there are no videos"""
+    mocker.patch("videos.youtube.is_ocw_site", return_value=True)
+    mocker.patch("videos.youtube.is_youtube_enabled", return_value=True)
+    mock_youtube = mocker.patch("videos.youtube.YouTubeApi")
+    update_youtube_metadata(WebsiteFactory.create())
+    mock_youtube.assert_not_called()
+
+
+@pytest.mark.parametrize("existing_captions", [True, False])
+def test_update_captions(settings, mocker, youtube_mocker, existing_captions):
+    """
+    Test update_captions
+    """
+    youtube_id = "abc123"
+    captions = b"these are the file contents!"
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id=youtube_id
+    )
+    video = videofile.video
+
+    video.webvtt_transcript_file = SimpleUploadedFile("file.txt", captions)
+    video.save()
+
+    content = WebsiteContentFactory.create(
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_id": youtube_id,
+            },
+        },
+        website=video.website,
+    )
+
+    if existing_captions:
+        existing_captions_response = {
+            "items": [
+                {"id": "youtube_caption_id", "snippet": {"name": CAPTION_UPLOAD_NAME}}
+            ]
+        }
+    else:
+        existing_captions_response = {"items": []}
+
+    mock_media_upload = mocker.patch("videos.youtube.MediaIoBaseUpload")
+    mock_bytes_io = mocker.patch("videos.youtube.BytesIO")
+
+    youtube_mocker().captions.return_value.list.return_value.execute.return_value = (
+        existing_captions_response
+    )
+
+    YouTubeApi().update_captions(content, youtube_id)
+    youtube_mocker().captions.return_value.list.assert_any_call(
+        part="snippet", videoId=youtube_id
+    )
+
+    mock_bytes_io.assert_called_once_with(captions)
+
+    mock_media_upload.assert_called_once_with(
+        mock_bytes_io.return_value, mimetype="text/vtt", chunksize=-1, resumable=True
+    )
+
+    if existing_captions:
+        youtube_mocker().captions.return_value.update.assert_any_call(
+            part="snippet",
+            body={"id": "youtube_caption_id"},
+            media_body=mock_media_upload.return_value,
+        )
+    else:
+        youtube_mocker().captions.return_value.insert.assert_any_call(
+            part="snippet",
+            sync=False,
+            body={
+                "snippet": {
+                    "language": "en",
+                    "name": CAPTION_UPLOAD_NAME,
+                    "videoId": youtube_id,
+                }
+            },
+            media_body=mock_media_upload.return_value,
+        )
+
+
+@pytest.mark.parametrize(
+    ("existing_name", "expected_method"),
+    [
+        ("", "insert"),
+        ("ocw_captions_upload", "insert"),
+        ("CC (English)", "update"),
+    ],
+)
+def test_update_captions_name(mocker, youtube_mocker, existing_name, expected_method):
+    """Verify that the caption name used is CC (English)"""
+    mock_captions = youtube_mocker().captions
+    mock_captions().list().execute.return_value = {
+        "items": [{"id": "test_id", "snippet": {"name": existing_name}}]
+        if existing_name
+        else []
+    }
+
+    website = WebsiteFactory.create()
+    resource = WebsiteContentFactory.create(website=website)
+
+    video_file = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE,
+        destination_id="dummy_video_id",
+        video__website=website,
+    )
+
+    video_file.video.webvtt_transcript_file = SimpleUploadedFile(
+        "dummy.vtt", b"some vtt", content_type="text/vtt"
+    )
+    video_file.video.save()
+
+    YouTubeApi().update_captions(resource, "dummy_video_id")
+
+    if expected_method == "insert":
+        mock_captions().insert.assert_called_once()
+        mock_captions().update.assert_not_called()
+        assert (
+            mock_captions().insert.call_args[1]["body"]["snippet"]["name"]
+            == "CC (English)"
+        )
+    else:
+        mock_captions().update.assert_called_once()
+        mock_captions().insert.assert_not_called()

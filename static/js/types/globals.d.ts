@@ -1,0 +1,40 @@
+/* eslint-disable camelcase */
+/* eslint-disable one-var */
+/* eslint-disable no-var */
+
+interface SETTINGS {
+  reactGaDebug: string;
+  gaTrackingID: string;
+  public_path: string;
+  environment: string;
+  release_version: string;
+  sentry_dsn: string;
+  gdrive_enabled: boolean;
+  features_default: boolean;
+  features: {[key: string]: boolean};
+  posthog_api_host: string?;
+  posthog_project_api_key: string?;
+  sitemapDomain: string;
+  maxTitle: number;
+  deletableContentTypes: string[];
+  /** The starter slug of OCW course sites (OCW_COURSE_STARTER_SLUG). */
+  ocwCourseStarterSlug: string;
+  /**
+   * Settings.user does exist, but leaving it untyped to help encourage using
+   * `store.user` instead.
+   */
+  // user: User | null;
+}
+export declare global {
+
+  declare var SETTINGS: SETTINGS
+
+  declare var RELEASE_YEAR: string
+
+  declare var _testing: boolean
+
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  declare var __REDUX_DEVTOOLS_EXTENSION__: Function
+
+  declare var __webpack_public_path__: string
+}

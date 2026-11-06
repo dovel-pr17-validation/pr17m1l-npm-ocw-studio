@@ -1,0 +1,110 @@
+---
+name: CI
+on:
+  push:
+    branches:
+    - master
+    - release
+    - release-candidate
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-24.04
+
+    services:
+      db:
+        image: postgres:18.1
+        # Health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres # pragma: allowlist secret
+          POSTGRES_DB: postgres
+        ports:
+        - 5432:5432
+
+      redis:
+        image: redis:8.4.0
+        ports:
+        - 6379:6379
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      with:
+        enable-cache: false
+
+    - name: Install Python
+      run: uv python install 3.14
+
+    - name: Install dependencies
+      run: uv sync --locked
+
+    - name: Tests
+      run: |
+        uv run ./manage.py check --fail-level WARNING
+        export MEDIA_ROOT="$(mktemp -d)"
+        sudo mkdir /var/media
+        sudo chown -R $USER:$USER /var/media
+        uv run ./scripts/test/python_tests.sh
+      env:
+        OCW_STUDIO_DB_DISABLE_SSL: "True"
+        OCW_STUDIO_SECURE_SSL_REDIRECT: "False"
+        CELERY_TASK_ALWAYS_EAGER: "True"
+        CELERY_BROKER_URL: redis://localhost:6379/4
+        CELERY_RESULT_BACKEND: redis://localhost:6379/4
+        DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres   # pragma: allowlist secret
+        DEBUG: "False"
+        MAILGUN_SENDER_DOMAIN: "fake.example.com"
+        MAILGUN_KEY: "fake"
+        NODE_ENV: "production"
+        OCW_STUDIO_BASE_URL: "http://localhost:8043/"
+        SECRET_KEY: "secret"   # pragma: allowlist secret
+        CONTENT_SYNC_BACKEND:
+
+  frontend-tests:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Setup NodeJS
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v7.1.0
+      with:
+        node-version: 24
+
+    - name: Install dependencies
+      run: yarn install --immutable
+
+    - name: Lints
+      run: npm run lint
+
+    - name: Code formatting
+      run: npm run fmt:check
+
+    - name: Scss lint
+      run: npm run scss_lint
+
+    - name: Typechecking
+      run: npm run typecheck
+
+    - name: Tests
+      run: npm run test:coverage
+      env:
+        NODE_ENV: development
+
+    - name: Webpack build
+      run: npm run build

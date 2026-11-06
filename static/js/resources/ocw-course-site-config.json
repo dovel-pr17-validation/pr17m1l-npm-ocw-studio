@@ -1,0 +1,839 @@
+{
+  "collections": [
+    {
+      "category": "Content",
+      "fields": [
+        {
+          "label": "Title",
+          "name": "title",
+          "required": true,
+          "widget": "string"
+        },
+        {
+          "embed": ["resource"],
+          "label": "Body",
+          "link": ["resource", "page"],
+          "name": "body",
+          "widget": "markdown"
+        }
+      ],
+      "folder": "content/pages",
+      "label": "Pages",
+      "name": "page"
+    },
+    {
+      "category": "Content",
+      "fields": [
+        {
+          "label": "Description",
+          "name": "description",
+          "widget": "markdown"
+        },
+        {
+          "collection": "resource",
+          "display_field": "title",
+          "filter": {
+            "field": "resourcetype",
+            "filter_type": "equals",
+            "value": "Video"
+          },
+          "label": "Videos",
+          "multiple": true,
+          "name": "videos",
+          "sortable": true,
+          "widget": "relation"
+        }
+      ],
+      "folder": "content/video_galleries",
+      "label": "Video Gallery",
+      "name": "video_gallery"
+    },
+    {
+      "category": "Content",
+      "fields": [
+        {
+          "label": "Title",
+          "name": "title",
+          "required": true,
+          "widget": "string"
+        },
+        {
+          "label": "Description",
+          "minimal": true,
+          "name": "description",
+          "widget": "markdown"
+        },
+        {
+          "label": "Resource Type",
+          "name": "resourcetype",
+          "options": ["Image", "Video", "Document", "Other"],
+          "required": true,
+          "widget": "select"
+        },
+        {
+          "label": "Mime Type",
+          "name": "file_type",
+          "widget": "hidden"
+        },
+        {
+          "label": "File",
+          "name": "file",
+          "widget": "file"
+        },
+        {
+          "label": "Learning Resource Types",
+          "multiple": true,
+          "name": "learning_resource_types",
+          "options": [
+            "Activity Assignments",
+            "Activity Assignments with Examples",
+            "Competition Videos",
+            "Demonstration Audio",
+            "Demonstration Videos",
+            "Design Assignments",
+            "Design Assignments with Examples",
+            "Exams",
+            "Exam Solutions",
+            "Laboratory Assignments",
+            "Lecture Audio",
+            "Lecture Notes",
+            "Lecture Videos",
+            "Media Assignments",
+            "Media Assignments with Examples",
+            "Multiple Assignment Types",
+            "Multiple Assignment Types with Solutions",
+            "Music Audio",
+            "Open Textbooks",
+            "Other Audio",
+            "Other Video",
+            "Presentation Assignments",
+            "Presentation Assignments with Examples",
+            "Problem Sets",
+            "Problem Set Solutions",
+            "Problem-solving Notes",
+            "Problem-solving Videos",
+            "Programming Assignments",
+            "Programming Assignments with Examples",
+            "Projects",
+            "Projects with Examples",
+            "Readings",
+            "Simulation Videos",
+            "Supplemental Exam Materials",
+            "Tools",
+            "Tutorial Videos",
+            "Video Materials",
+            "Videos",
+            "Workshop Videos",
+            "Written Assignments",
+            "Written Assignments with Examples"
+          ],
+          "widget": "select"
+        },
+        {
+          "default": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+          "label": "License",
+          "name": "license",
+          "options": [
+            {
+              "label": "CC-BY-NC-SA",
+              "value": "https://creativecommons.org/licenses/by-nc-sa/4.0/"
+            },
+            {
+              "label": "CC-BY",
+              "value": "https://creativecommons.org/licenses/by/4.0/"
+            },
+            {
+              "label": "CC-BY-NC",
+              "value": "https://creativecommons.org/licenses/by-nc/4.0/"
+            },
+            {
+              "label": "public domain",
+              "value": "https://creativecommons.org/publicdomain/zero/1.0/"
+            }
+          ],
+          "required": true,
+          "widget": "select"
+        },
+        {
+          "condition": {
+            "equals": "Image",
+            "field": "resourcetype"
+          },
+          "fields": [
+            {
+              "label": "ALT text",
+              "name": "image-alt",
+              "widget": "string"
+            },
+            {
+              "label": "Caption",
+              "name": "caption",
+              "widget": "string"
+            },
+            {
+              "label": "Credit",
+              "name": "credit",
+              "widget": "text"
+            }
+          ],
+          "label": "Image Metadata",
+          "name": "image_metadata",
+          "widget": "object"
+        },
+        {
+          "condition": {
+            "equals": "Video",
+            "field": "resourcetype"
+          },
+          "fields": [
+            {
+              "label": "Youtube ID",
+              "name": "youtube_id",
+              "widget": "string"
+            },
+            {
+              "label": "Youtube Speakers",
+              "name": "video_speakers",
+              "widget": "string"
+            },
+            {
+              "help": "Maximum 100 characters per tag, 500 characters total.",
+              "label": "Youtube Tags (comma separated)",
+              "name": "video_tags",
+              "widget": "text"
+            }
+          ],
+          "label": "Video Metadata",
+          "name": "video_metadata",
+          "widget": "object"
+        },
+        {
+          "condition": {
+            "equals": "Video",
+            "field": "resourcetype"
+          },
+          "fields": [
+            {
+              "label": "Video Thumbnail URL",
+              "name": "video_thumbnail_file",
+              "widget": "string"
+            },
+            {
+              "collection": "resource",
+              "display_field": "title",
+              "filter": {
+                "field": "resourcetype",
+                "filter_type": "equals",
+                "value": "Other"
+              },
+              "label": "Video Captions Resources",
+              "multiple": true,
+              "name": "video_captions_resources",
+              "widget": "relation"
+            },
+            {
+              "collection": "resource",
+              "display_field": "title",
+              "filter": {
+                "field": "resourcetype",
+                "filter_type": "equals",
+                "value": "Document"
+              },
+              "label": "Video Transcript Resources",
+              "multiple": true,
+              "name": "video_transcript_resources",
+              "widget": "relation"
+            }
+          ],
+          "label": "Video Files",
+          "name": "video_files",
+          "widget": "object"
+        }
+      ],
+      "folder": "content/resources",
+      "label": "Resources",
+      "name": "resource"
+    },
+    {
+      "category": "Settings",
+      "files": [
+        {
+          "fields": [
+            {
+              "label": "Course Title",
+              "name": "course_title",
+              "required": true,
+              "widget": "string"
+            },
+            {
+              "label": "Course Description",
+              "name": "course_description",
+              "widget": "markdown"
+            },
+            {
+              "label": "Primary Course Number",
+              "name": "primary_course_number",
+              "required": true,
+              "widget": "string"
+            },
+            {
+              "label": "Extra Course Numbers (comma separated list)",
+              "name": "extra_course_numbers",
+              "widget": "string"
+            },
+            {
+              "collection": "resource",
+              "display_field": "title",
+              "filter": {
+                "field": "resourcetype",
+                "filter_type": "equals",
+                "value": "Image"
+              },
+              "label": "Course Image",
+              "multiple": false,
+              "name": "course_image",
+              "widget": "relation"
+            },
+            {
+              "label": "Department Numbers",
+              "min": 1,
+              "multiple": true,
+              "name": "department_numbers",
+              "options": [
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+                "14",
+                "15",
+                "16",
+                "17",
+                "18",
+                "20",
+                "21A",
+                "21G",
+                "21H",
+                "21L",
+                "21M",
+                "22",
+                "24",
+                "CC",
+                "CMS-W",
+                "EC",
+                "ES",
+                "ESD",
+                "HST",
+                "IDS",
+                "MAS",
+                "PE",
+                "RES",
+                "STS",
+                "WGS"
+              ],
+              "widget": "select"
+            },
+            {
+              "label": "Level",
+              "multiple": true,
+              "name": "level",
+              "options": ["Undergraduate", "Graduate", "Non Credit"],
+              "widget": "select"
+            },
+            {
+              "label": "Term",
+              "name": "term",
+              "options": ["Spring", "Summer", "Fall", "January IAP"],
+              "widget": "select"
+            },
+            {
+              "label": "Year",
+              "name": "year",
+              "widget": "string"
+            },
+            {
+              "label": "Learning Resource Types",
+              "multiple": true,
+              "name": "learning_resource_types",
+              "options": [
+                "Activity Assignments",
+                "Activity Assignments with Examples",
+                "Competition Videos",
+                "Demonstration Audio",
+                "Demonstration Videos",
+                "Design Assignments",
+                "Design Assignments with Examples",
+                "Exams",
+                "Exam Solutions",
+                "Image Gallery",
+                "Laboratory Assignments",
+                "Lecture Audio",
+                "Lecture Notes",
+                "Lecture Videos",
+                "Media Assignments",
+                "Media Assignments with Examples",
+                "Multiple Assignment Types",
+                "Multiple Assignment Types with Solutions",
+                "Music Audio",
+                "Open Textbooks",
+                "Other Audio",
+                "Other Video",
+                "Presentation Assignments",
+                "Presentation Assignments with Examples",
+                "Problem Sets",
+                "Problem Set Solutions",
+                "Problem-solving Notes",
+                "Problem-solving Videos",
+                "Programming Assignments",
+                "Programming Assignments with Examples",
+                "Projects",
+                "Projects with Examples",
+                "Readings",
+                "Simulation Videos",
+                "Supplemental Exam Materials",
+                "Tutorial Videos",
+                "Video Materials",
+                "Videos",
+                "Workshop Videos",
+                "Written Assignments",
+                "Written Assignments with Examples"
+              ],
+              "widget": "select"
+            },
+            {
+              "collection": "instructor",
+              "display_field": "title",
+              "label": "Instructors",
+              "multiple": true,
+              "name": "instructors",
+              "website": "ocw-www",
+              "widget": "relation"
+            },
+            {
+              "label": "Topics",
+              "levels": [
+                {
+                  "label": "Topic",
+                  "name": "topic"
+                },
+                {
+                  "label": "Subtopic",
+                  "name": "subtopic"
+                },
+                {
+                  "label": "Speciality",
+                  "name": "speciality"
+                }
+              ],
+              "name": "topics",
+              "options_map": {
+                "Business": {
+                  "Accounting": [],
+                  "Business Ethics": [],
+                  "Entrepreneurship": [],
+                  "Finance": [],
+                  "Globalization": [],
+                  "Health Care Management": [],
+                  "Industrial Relations and Human Resource Management": [],
+                  "Information Technology": [],
+                  "Innovation": [],
+                  "Leadership": [],
+                  "Management": [],
+                  "Marketing": [],
+                  "Operations Management": [],
+                  "Organizational Behavior": [],
+                  "Project Management": [],
+                  "Real Estate": [],
+                  "Supply Chain Management": []
+                },
+                "Energy": {
+                  "Buildings": [],
+                  "Climate": [],
+                  "Combustion": [],
+                  "Electricity": [],
+                  "Fossil Fuels": [],
+                  "Fuel Cells": [],
+                  "Hydrogen and Alternatives": [],
+                  "Nuclear": [],
+                  "Renewables": [],
+                  "Technology": [],
+                  "Transportation": []
+                },
+                "Engineering": {
+                  "Aerospace Engineering": [
+                    "Astrodynamics",
+                    "Structural Mechanics",
+                    "Aerodynamics",
+                    "Propulsion Systems",
+                    "Materials Selection",
+                    "Avionics",
+                    "Guidance and Control Systems",
+                    "Bioastronautics"
+                  ],
+                  "Biological Engineering": [
+                    "Biostatistics",
+                    "Biotechnology",
+                    "Computational Biology",
+                    "Biomaterials",
+                    "Synthetic Biology",
+                    "Cell and Tissue Engineering",
+                    "Biomechanics"
+                  ],
+                  "Chemical Engineering": [
+                    "Molecular Engineering",
+                    "Process Control Systems",
+                    "Polymers",
+                    "Transport Processes",
+                    "Separation Processes"
+                  ],
+                  "Civil Engineering": [
+                    "Geotechnical Engineering",
+                    "Surveying",
+                    "Transportation Engineering",
+                    "Structural Engineering",
+                    "Construction Management"
+                  ],
+                  "Computer Science": [
+                    "Algorithms and Data Structures",
+                    "Graphics and Visualization",
+                    "Human-Computer Interfaces",
+                    "Operating Systems",
+                    "Programming Languages",
+                    "Artificial Intelligence",
+                    "Software Design and Engineering",
+                    "Data Mining",
+                    "Theory of Computation",
+                    "Cryptography",
+                    "Computer Design and Engineering",
+                    "Computer Networks"
+                  ],
+                  "Electrical Engineering": [
+                    "Robotics and Control Systems",
+                    "Electronics",
+                    "Signal Processing",
+                    "Electric Power",
+                    "Digital Systems",
+                    "Telecommunications"
+                  ],
+                  "Environmental Engineering": [
+                    "Hydrology and Water Resource Systems",
+                    "Aquatic Sciences and Water Quality Control",
+                    "Hydrodynamics and Coastal Engineering",
+                    "Environmental Management"
+                  ],
+                  "Materials Science and Engineering": [
+                    "Electronic Materials",
+                    "Metallurgical Engineering",
+                    "Polymeric Materials",
+                    "Composite Materials"
+                  ],
+                  "Mechanical Engineering": [
+                    "Microtechnology",
+                    "Fluid Mechanics",
+                    "Solid Mechanics",
+                    "Mechanical Design",
+                    "Dynamics and Control"
+                  ],
+                  "Nanotechnology": [],
+                  "Nuclear Engineering": [
+                    "Nuclear Systems, Policy, and Economics",
+                    "Radiological Engineering",
+                    "Nuclear Materials"
+                  ],
+                  "Ocean Engineering": [
+                    "Oceanic Pollution Control",
+                    "Ocean Structures",
+                    "Hydrodynamics",
+                    "Ocean Exploration"
+                  ],
+                  "Systems Engineering": [
+                    "Systems Optimization",
+                    "Computational Modeling and Simulation",
+                    "Computational Science and Engineering",
+                    "Systems Design",
+                    "Numerical Simulation"
+                  ]
+                },
+                "Fine Arts": {
+                  "Architecture": [
+                    "Religious Architecture",
+                    "Architectural Design",
+                    "Environmental Design",
+                    "Architectural History and Criticism",
+                    "Architectural Engineering"
+                  ],
+                  "Art History": [],
+                  "Game Design": [],
+                  "Media Studies": ["Digital Media"],
+                  "Music": [
+                    "Music Theory",
+                    "Music History",
+                    "Music Performance"
+                  ],
+                  "Performance Arts": ["Dance", "Theatrical Design", "Theater"],
+                  "Visual Arts": [
+                    "Photography",
+                    "Film and Video",
+                    "Graphic Design"
+                  ]
+                },
+                "Health and Medicine": {
+                  "Anatomy and Physiology": [],
+                  "Biomedical Enterprise": [],
+                  "Biomedical Instrumentation": [],
+                  "Biomedical Signal and Image Processing": [],
+                  "Biomedicine": [],
+                  "Cancer": [],
+                  "Cellular and Molecular Medicine": [],
+                  "Epidemiology": [],
+                  "Functional Genomics": [],
+                  "Health and Exercise Science": [],
+                  "Immunology": [],
+                  "Medical Imaging": [],
+                  "Mental Health": [],
+                  "Pathology and Pathophysiology": [],
+                  "Pharmacology and Toxicology": [],
+                  "Physical Education and Recreation": [],
+                  "Public Health": [],
+                  "Sensory-Neural Systems": [],
+                  "Social Medicine": [],
+                  "Spectroscopy": [],
+                  "Speech Pathology": []
+                },
+                "Humanities": {
+                  "History": [
+                    "European History",
+                    "American History",
+                    "Historiography",
+                    "Latin American History",
+                    "Asian History",
+                    "World History",
+                    "Military History",
+                    "Ancient History",
+                    "History of Science and Technology",
+                    "Intellectual History",
+                    "Comparative History",
+                    "Medieval History",
+                    "Historical Methods",
+                    "Modern History",
+                    "Middle Eastern History",
+                    "African History",
+                    "Jewish History"
+                  ],
+                  "Language": [
+                    "French",
+                    "Spanish",
+                    "Portuguese",
+                    "English as a Second Language",
+                    "Chinese",
+                    "Italian",
+                    "Japanese",
+                    "German"
+                  ],
+                  "Linguistics": ["Phonology", "Syntax", "Semantics"],
+                  "Literature": [
+                    "Academic Writing",
+                    "Fiction",
+                    "Periodic Literature",
+                    "Criticism",
+                    "Rhetoric",
+                    "Technical Writing",
+                    "American Literature",
+                    "Biography",
+                    "Drama",
+                    "Comedy",
+                    "Classics",
+                    "Comparative Literature",
+                    "International Literature",
+                    "Creative Writing",
+                    "Nonfiction Prose",
+                    "Poetry"
+                  ],
+                  "Philosophy": [
+                    "Philosophy of Language",
+                    "Epistemology",
+                    "Political Philosophy",
+                    "Metaphysics",
+                    "Ethics",
+                    "Logic"
+                  ],
+                  "Religion": []
+                },
+                "Mathematics": {
+                  "Algebra and Number Theory": [],
+                  "Applied Mathematics": [],
+                  "Calculus": [],
+                  "Computation": [],
+                  "Differential Equations": [],
+                  "Discrete Mathematics": [],
+                  "Linear Algebra": [],
+                  "Mathematical Analysis": [],
+                  "Mathematical Logic": [],
+                  "Probability and Statistics": [],
+                  "Topology and Geometry": []
+                },
+                "Science": {
+                  "Biology": [
+                    "Stem Cells",
+                    "Virology",
+                    "Molecular Biology",
+                    "Neuroscience",
+                    "Cell Biology",
+                    "Developmental Biology",
+                    "Computation and Systems Biology",
+                    "Structural Biology",
+                    "Biophysics",
+                    "Genetics",
+                    "Neurobiology",
+                    "Microbiology",
+                    "Proteomics",
+                    "Ecology",
+                    "Biochemistry"
+                  ],
+                  "Chemistry": [
+                    "Analytical Chemistry",
+                    "Physical Chemistry",
+                    "Organic Chemistry",
+                    "Inorganic Chemistry"
+                  ],
+                  "Cognitive Science": [],
+                  "Earth Science": [
+                    "Planetary Science",
+                    "Geology",
+                    "Atmospheric Science",
+                    "Climate Studies",
+                    "Environmental Science",
+                    "Geochemistry",
+                    "Oceanography",
+                    "Geobiology",
+                    "Sustainability",
+                    "Geophysics"
+                  ],
+                  "Physics": [
+                    "Quantum Mechanics",
+                    "Atomic, Molecular, Optical Physics",
+                    "Theoretical Physics",
+                    "High Energy Physics",
+                    "Nuclear Physics",
+                    "Particle Physics",
+                    "Classical Mechanics",
+                    "Electromagnetism",
+                    "Relativity",
+                    "Condensed Matter Physics",
+                    "Astrophysics",
+                    "Thermodynamics"
+                  ]
+                },
+                "Social Science": {
+                  "Anthropology": [
+                    "Cultural Anthropology",
+                    "Ethnography",
+                    "Social Anthropology",
+                    "Biological Anthropology"
+                  ],
+                  "Archaeology": [],
+                  "Communication": [],
+                  "Economics": [
+                    "Industrial Organization",
+                    "Political Economy",
+                    "Macroeconomics",
+                    "Public Economics",
+                    "Financial Economics",
+                    "Microeconomics",
+                    "Developmental Economics",
+                    "International Development",
+                    "Labor Economics",
+                    "International Economics",
+                    "Econometrics"
+                  ],
+                  "Game Theory": [],
+                  "Geography": [],
+                  "Legal Studies": [],
+                  "Political Science": [
+                    "American Politics",
+                    "International Relations",
+                    "Comparative Politics"
+                  ],
+                  "Psychology": [],
+                  "Public Administration": [
+                    "Environmental Policy",
+                    "Social Welfare",
+                    "Regional Politics",
+                    "Public Policy",
+                    "Military Studies",
+                    "Security Studies",
+                    "Science and Technology Policy"
+                  ],
+                  "Sociology": ["Community Development", "Social Justice"],
+                  "Urban Studies": [
+                    "Housing Development",
+                    "Regional Planning",
+                    "Urban Planning",
+                    "Transportation Planning"
+                  ]
+                },
+                "Society": {
+                  "African American Studies": [],
+                  "Asian Studies": [],
+                  "European and Russian Studies": [],
+                  "Gender Studies": [],
+                  "Global Poverty": [],
+                  "Indigenous Studies": [],
+                  "Latin and Caribbean Studies": [],
+                  "Middle Eastern Studies": [],
+                  "The Developing World": [],
+                  "Women's Studies": []
+                },
+                "Teaching and Education": {
+                  "Curriculum and Teaching": [],
+                  "Education Policy": [],
+                  "Educational Technology": [],
+                  "Higher Education": []
+                }
+              },
+              "widget": "hierarchical-select"
+            },
+            {
+              "label": "Legacy UID",
+              "name": "legacy_uid",
+              "widget": "hidden"
+            }
+          ],
+          "file": "data/course.json",
+          "label": "Course Metadata",
+          "name": "sitemetadata"
+        }
+      ],
+      "label": "Metadata",
+      "name": "metadata"
+    },
+    {
+      "category": "Settings",
+      "files": [
+        {
+          "fields": [
+            {
+              "label": "Menu",
+              "name": "leftnav",
+              "widget": "menu"
+            }
+          ],
+          "file": "config/_default/menus.yaml",
+          "label": "Navigation Menu",
+          "name": "navmenu"
+        }
+      ],
+      "label": "Menu",
+      "name": "menu"
+    }
+  ],
+  "root-url-path": "courses",
+  "site-url-format": "[sitemetadata:primary_course_number]-[sitemetadata:course_title]-[sitemetadata:term]-[sitemetadata:year]"
+}

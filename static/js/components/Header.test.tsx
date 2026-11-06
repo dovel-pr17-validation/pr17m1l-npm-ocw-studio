@@ -1,0 +1,203 @@
+import React from "react"
+import { act } from "@testing-library/react"
+import * as dtl from "@testing-library/dom"
+import userEvent from "@testing-library/user-event"
+import {
+  IntegrationTestHelper,
+  assertInstanceOf,
+  absoluteUrl,
+  flushEventQueue,
+  mergeXProd,
+} from "../testing_utils"
+
+import Header from "./Header"
+import { logoutUrl, siteApiDetailUrl } from "../lib/urls"
+import { makeWebsiteDetail } from "../util/factories/websites"
+import { PublishStatus, SiteType, SITE_TYPE_LABELS } from "../constants"
+
+describe("Header without loaded website", () => {
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  it("includes the site logo and mit logo", () => {
+    const helper = new IntegrationTestHelper()
+
+    const [result] = helper.render(<Header />)
+    const mitLogo = result.getByAltText("MIT")
+    const ocwLogo = result.getByAltText("OCW Studio")
+
+    assertInstanceOf(mitLogo, HTMLImageElement)
+    assertInstanceOf(ocwLogo, HTMLImageElement)
+
+    expect(mitLogo.src).toBe(absoluteUrl("/static/images/mit-logo.png"))
+    expect(ocwLogo.src).toBe(absoluteUrl("/static/images/ocw-studio-logo.png"))
+  })
+
+  it("shows the user's name and logout link for logged in users", async () => {
+    const helper = new IntegrationTestHelper()
+    const [result] = helper.render(<Header />)
+    const links = result.container.querySelector("div.links")
+
+    assertInstanceOf(links, HTMLElement)
+
+    const username = dtl.getByText(links, "Jane Doe")
+    assertInstanceOf(username, HTMLSpanElement)
+
+    const logout = dtl.getByText(links, "Log out")
+    assertInstanceOf(logout, HTMLAnchorElement)
+    expect(logout.href).toBe(absoluteUrl(logoutUrl.toString()))
+
+    const submitSpy = jest
+      .spyOn(HTMLFormElement.prototype, "submit")
+      .mockImplementation(jest.fn())
+    await userEvent.click(logout)
+
+    const form = document.body.querySelector(
+      'form[action="/logout/"]',
+    ) as HTMLFormElement
+    expect(form).not.toBeNull()
+    expect(form.method).toBe("post")
+    const csrfInput = form.querySelector(
+      'input[name="csrfmiddlewaretoken"]',
+    ) as HTMLInputElement
+    expect(csrfInput).not.toBeNull()
+    expect(submitSpy).toHaveBeenCalled()
+  })
+
+  it("does not show username+logout for anonymous users", () => {
+    const helper = new IntegrationTestHelper()
+    helper.patchInitialReduxState({ user: { user: null } })
+    const [result] = helper.render(<Header />)
+    const links = result.container.querySelector("div.links")
+    expect(links).toBe(null)
+  })
+})
+
+const makeWebsiteWithStatus = (status: PublishStatus, live: boolean) => {
+  const statusField = live ? "live_publish_status" : "draft_publish_status"
+  const statusDateField = live
+    ? "live_publish_status_updated_on"
+    : "draft_publish_status_updated_on"
+  return makeWebsiteDetail({
+    live_publish_status: PublishStatus.Aborted,
+    draft_publish_status: PublishStatus.Aborted,
+    live_publish_status_updated_on: "2020-01-01",
+    draft_publish_status_updated_on: "2020-01-01",
+    [statusField]: status,
+    [statusDateField]: "2021-01-01",
+  })
+}
+
+describe("Header with a loaded website", () => {
+  it("shows the website title", async () => {
+    const helper = new IntegrationTestHelper()
+    const website = makeWebsiteDetail()
+    const [result] = helper.render(<Header website={website} />)
+
+    const h2 = result.getByText(website.title)
+
+    expect(h2.tagName).toBe("H2")
+  })
+
+  it.each([
+    { siteType: SiteType.OCW, expectedLabel: SITE_TYPE_LABELS[SiteType.OCW] },
+    { siteType: SiteType.PK12, expectedLabel: SITE_TYPE_LABELS[SiteType.PK12] },
+  ])(
+    "shows the site type badge for $siteType",
+    ({ siteType, expectedLabel }) => {
+      const helper = new IntegrationTestHelper()
+      const website = makeWebsiteDetail({ site_type: siteType })
+      const [result] = helper.render(<Header website={website} />)
+
+      expect(result.getByText(expectedLabel)).toBeInTheDocument()
+    },
+  )
+
+  const liveCases = [{ isLive: true }, { isLive: false }]
+  const statusCases = {
+    polling: [
+      { status: PublishStatus.NotStarted, expectedText: "Not started" },
+      { status: PublishStatus.Pending, expectedText: "In progress..." },
+    ],
+    noPolling: [
+      { status: PublishStatus.Success, expectedText: "Succeeded" },
+      { status: PublishStatus.Errored, expectedText: "Failed" },
+      { status: PublishStatus.Aborted, expectedText: "Aborted" },
+    ],
+  }
+
+  it.each(mergeXProd(liveCases, statusCases.noPolling))(
+    "does not poll for publishing updates when status=$status",
+    async ({ status, isLive }) => {
+      jest.useFakeTimers()
+
+      const helper = new IntegrationTestHelper()
+      const website = makeWebsiteWithStatus(status, isLive)
+
+      helper.render(<Header website={website} />)
+
+      const pollingInterval = 5000
+      jest.advanceTimersByTime(pollingInterval + 100)
+      await flushEventQueue(true)
+
+      expect(helper.handleRequest).toHaveBeenCalledTimes(0)
+    },
+  )
+
+  it.each(mergeXProd(liveCases, statusCases.polling))(
+    "does poll for publishing updates when status=$status",
+    async ({ status, isLive }) => {
+      jest.useFakeTimers()
+
+      const helper = new IntegrationTestHelper()
+
+      const website = makeWebsiteWithStatus(status, isLive)
+      const statusUrl = siteApiDetailUrl
+        .param({ name: website.name })
+        .query({ only_status: true })
+        .toString()
+      helper.mockGetRequest(statusUrl, website)
+
+      helper.render(<Header website={website} />)
+
+      const pollingInterval = 5000
+      jest.advanceTimersByTime(pollingInterval + 100)
+      await flushEventQueue(true)
+
+      expect(helper.handleRequest).toHaveBeenCalledTimes(1)
+      expect(helper.handleRequest).toHaveBeenCalledWith(statusUrl, "GET", {})
+    },
+  )
+
+  it.each(
+    mergeXProd(liveCases, [...statusCases.noPolling, ...statusCases.polling]),
+  )(
+    'shows text "$expectedText" when status=$status',
+    ({ status, expectedText, isLive }) => {
+      const helper = new IntegrationTestHelper()
+      const website = makeWebsiteWithStatus(status, isLive)
+
+      const [result] = helper.render(<Header website={website} />)
+      expect(result.getByText(expectedText)).toBeDefined()
+    },
+  )
+
+  test("clicking publish opens the publish drawer", async () => {
+    const helper = new IntegrationTestHelper()
+    const website = makeWebsiteDetail()
+    const [result, { history }] = helper.render(<Header website={website} />)
+    await flushEventQueue()
+    const publishButton = result.getByTitle("Publish")
+    assertInstanceOf(publishButton, HTMLButtonElement)
+    const user = userEvent.setup()
+    await act(() =>
+      user.pointer([{ target: publishButton }, { keys: "[MouseLeft]" }]),
+    )
+
+    result.getByText("Publish your site")
+    expect(history.location.search).toBe("?publish=")
+
+    result.unmount()
+  })
+})

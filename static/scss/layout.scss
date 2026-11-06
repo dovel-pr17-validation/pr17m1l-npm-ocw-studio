@@ -1,0 +1,134 @@
+// Layout goes here
+@import "bootstrap/scss/bootstrap";
+@import "react-nestable/dist/styles/index.css";
+@import "variables";
+@import "common";
+@import "button";
+@import "header";
+@import "footer";
+@import "home-page";
+@import "site-page";
+@import "dashboard";
+@import "site-collaborators";
+@import "forms";
+@import "list";
+@import "ckeditor";
+@import "resource-embed-widget";
+@import "image-gallery-widget";
+@import "resource-picker-dialog";
+@import "content-listing";
+
+body {
+  font-family: Montserrat, sans-serif;
+  background-color: $studio-background;
+
+  // default font color
+  color: $studio-black;
+  font-size: $std-font-size;
+}
+
+.app {
+  height: calc(100vh - 50px);
+
+  .page-content {
+    max-width: $std-max-width;
+    margin: 0 auto;
+  }
+}
+
+.app-content {
+  min-height: calc(100vh - 48px);
+  margin: 0 auto;
+}
+
+.std-page-body {
+  max-width: $std-max-width;
+}
+
+.narrow-page-body {
+  max-width: $narrow-max-width;
+}
+
+.border-bottom-gray {
+  border-bottom: 1px solid $studio-gray;
+}
+
+.text-gray {
+  color: $studio-text-gray;
+}
+
+.dark-gray {
+  color: $studio-dark-gray;
+}
+
+// modal as sidebar CSS adapted from https://codepen.io/bootpen/pen/jbbaRa
+$modal-sidebar-width-narrow: 540px;
+$modal-sidebar-width-wide: 80%;
+
+.modal.right {
+  .modal-dialog {
+    position: fixed;
+    margin: auto;
+    min-width: $modal-sidebar-width-narrow;
+    height: 100%;
+    transform: translate3d(0%, 0, 0);
+  }
+
+  &.wide .modal-dialog {
+    min-width: $modal-sidebar-width-wide;
+  }
+
+  .modal-header {
+    border-bottom: none;
+  }
+
+  .modal-content {
+    height: 100%;
+    overflow-y: auto;
+    border-radius: 0;
+  }
+
+  .modal-body {
+    padding: 15px 15px 80px;
+  }
+
+  &.fade {
+    .modal-dialog {
+      right: -$modal-sidebar-width-narrow;
+      transition:
+        opacity 0.3s linear,
+        right 0.3s ease-out;
+    }
+
+    &.wide .modal-dialog {
+      right: -$modal-sidebar-width-wide;
+    }
+
+    &.show .modal-dialog {
+      right: 0;
+    }
+  }
+}
+
+// Tabs
+.nav-tabs,
+.nav-tabs .nav-link,
+.nav-tabs .nav-link:active {
+  border-style: none;
+}
+
+// from https://ckeditor.com/docs/ckeditor5/latest/builds/guides/integration/frameworks/css.html
+
+/*
+ * Configure the z-index of the ckeditor UI, so when inside a Bootstrap
+ * modal, it will be rendered over the modal.
+ */
+:root {
+  --ck-z-default: 10000 !important;
+  --ck-z-modal: calc(var(--ck-z-default) + 999);
+}
+
+.dropdown-menu.right {
+  left: initial;
+  right: 0;
+}

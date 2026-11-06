@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% load i18n static %}
+
+{% block title %}{% trans "ocw_studio" %}{% endblock %}
+
+{% block content %}
+<div id="container"></div>
+{% load render_bundle %}
+{% render_bundle 'root' %}
+{% endblock %}

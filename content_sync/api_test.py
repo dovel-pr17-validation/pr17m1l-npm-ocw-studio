@@ -1,0 +1,549 @@
+"""Content sync api tests"""
+
+from datetime import timedelta
+from types import SimpleNamespace
+
+import pytest
+from django.db.models.signals import post_save
+from factory.django import mute_signals
+from mitol.common.utils import now_in_utc
+from requests import HTTPError
+
+from content_sync import api
+from content_sync.constants import VERSION_DRAFT, VERSION_LIVE
+from websites.constants import PUBLISH_STATUS_ERRORED, PUBLISH_STATUS_NOT_STARTED
+from websites.factories import (
+    WebsiteContentFactory,
+    WebsiteFactory,
+    WebsiteStarterFactory,
+)
+
+pytestmark = pytest.mark.django_db
+# pylint:disable=redefined-outer-name
+
+
+@pytest.fixture
+def mock_api_funcs(settings, mocker):
+    """Mock functions used in publish_websites"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.TestBackend"
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    return SimpleNamespace(
+        mock_get_backend=mocker.patch("content_sync.api.get_sync_backend"),
+        mock_get_pipeline=mocker.patch("content_sync.api.get_site_pipeline"),
+        mock_import_string=mocker.patch("content_sync.api.import_string"),
+        mock_get_mass_build_pipeline=mocker.patch(
+            "content_sync.tasks.api.get_mass_build_sites_pipeline"
+        ),
+    )
+
+
+def test_upsert_content_sync_state_create():
+    """Verify that upsert_content_sync_state creates a ContentSyncState record for the content"""
+    with mute_signals(post_save):
+        content = WebsiteContentFactory.create(markdown="abc")
+
+    assert getattr(content, "content_sync_state", None) is None
+
+    api.upsert_content_sync_state(content)
+
+    content.refresh_from_db()
+
+    abc_checksum = content.calculate_checksum()
+
+    assert content.content_sync_state is not None
+    assert content.content_sync_state.synced_checksum is None
+    assert content.content_sync_state.current_checksum == abc_checksum
+
+
+def test_upsert_content_sync_state_update(settings):
+    """Verify that upsert_content_sync_state updates a ContentSyncState record for the content"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    content = WebsiteContentFactory.create(markdown="abc")
+    abc_checksum = content.calculate_checksum()
+
+    sync_state = content.content_sync_state
+    sync_state.current_checksum = abc_checksum
+    sync_state.synced_checksum = abc_checksum
+    sync_state.save()
+
+    content.markdown = "def"
+
+    def_checksum = content.calculate_checksum()
+
+    with mute_signals(post_save):
+        content.save()
+
+    api.upsert_content_sync_state(content)
+
+    content.content_sync_state.refresh_from_db()
+    assert content.content_sync_state.synced_checksum == abc_checksum
+    assert content.content_sync_state.current_checksum == def_checksum
+
+
+def test_get_sync_backend(settings, mocker):
+    """Verify that get_sync_backend() imports the backend based on settings.py"""
+    settings.CONTENT_SYNC_BACKEND = "custom.backend.Backend"
+    import_string_mock = mocker.patch("content_sync.api.import_string")
+    website = WebsiteFactory.create()
+    api.get_sync_backend(website)
+    import_string_mock.assert_any_call("custom.backend.Backend")
+    import_string_mock.return_value.assert_any_call(website)
+
+
+def test_sync_content_enabled(settings, mocker):
+    """Verify sync_content runs if sync is enabled"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    mocker.patch("content_sync.api.is_sync_enabled", return_value=True)
+    log_mock = mocker.patch("content_sync.api.log")
+    get_sync_backend_mock = mocker.patch("content_sync.api.get_sync_backend")
+    sync_state = mocker.Mock()
+
+    api.sync_content(sync_state)
+
+    log_mock.debug.assert_not_called()
+    get_sync_backend_mock.assert_called_once_with(sync_state.content.website)
+    get_sync_backend_mock.return_value.sync_content_to_backend.assert_called_once_with(
+        sync_state
+    )
+
+
+def test_sync_content_disabled(settings, mocker):
+    """Verify sync_content doesn't run anything if sync is disabled"""
+    settings.CONTENT_SYNC_BACKEND = None
+    mocker.patch("content_sync.api.is_sync_enabled", return_value=False)
+    get_sync_backend_mock = mocker.patch("content_sync.api.get_sync_backend")
+    api.sync_content(None)
+    get_sync_backend_mock.assert_not_called()
+
+
+def test_create_website_backend(settings, mocker):
+    """Verify create_website_backend calls the appropriate task"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    mocker.patch("content_sync.api.is_sync_enabled", return_value=True)
+    mock_task = mocker.patch("content_sync.tasks.create_website_backend")
+    with mute_signals(post_save):
+        website = WebsiteFactory.create()
+    api.create_website_backend(website)
+    mock_task.delay.assert_called_once_with(website.name)
+
+
+def test_create_website_backend_disabled(settings, mocker):
+    """Verify create_website_backend doesn't do anything if syncing is disabled"""
+    settings.CONTENT_SYNC_BACKEND = ""
+    mocker.patch("content_sync.api.is_sync_enabled", return_value=False)
+    mock_task = mocker.patch("content_sync.tasks.create_website_backend")
+    with mute_signals(post_save):
+        website = WebsiteFactory.create()
+    api.create_website_backend(website)
+    mock_task.delay.assert_not_called()
+
+
+def test_update_website_backend(settings, mocker):
+    """Verify update_website_backend calls the appropriate task"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    mocker.patch("content_sync.api.is_sync_enabled", return_value=True)
+    mock_task = mocker.patch("content_sync.tasks.sync_website_content")
+    website = WebsiteFactory.create()
+    api.update_website_backend(website)
+    mock_task.delay.assert_called_once_with(website.name)
+
+
+def test_update_website_backend_disabled(settings, mocker):
+    """Verify update_website_backend doesn't do anything if syncing is disabled"""
+    settings.CONTENT_SYNC_BACKEND = None
+    mocker.patch("content_sync.api.is_sync_enabled", return_value=False)
+    mock_task = mocker.patch("content_sync.tasks.sync_website_content")
+    website = WebsiteFactory.create()
+    api.update_website_backend(website)
+    mock_task.delay.assert_not_called()
+
+
+def test_trigger_publish_draft(settings, mocker):
+    """Verify preview_website calls the appropriate task"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    mock_task = mocker.patch("content_sync.tasks.publish_website_backend_draft")
+    website = WebsiteFactory.create()
+    api.trigger_publish(website.name, VERSION_DRAFT)
+    mock_task.delay.assert_called_once_with(website.name)
+
+
+def test_trigger_publish_live(settings, mocker):
+    """Verify publish_website calls the appropriate task"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    mock_task = mocker.patch("content_sync.tasks.publish_website_backend_live")
+    website = WebsiteFactory.create()
+    api.trigger_publish(website.name, VERSION_LIVE)
+    mock_task.delay.assert_called_once_with(website.name)
+
+
+def test_trigger_unpublished_removal(settings, mocker):
+    """Verify trigger_unpublished_removal calls the appropriate task"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.SampleBackend"
+    mock_task = mocker.patch("content_sync.tasks.trigger_unpublished_removal")
+    api.trigger_unpublished_removal(WebsiteFactory.build())
+    mock_task.delay.assert_called_once()
+
+
+@pytest.mark.parametrize("is_default_theme_site", [True, False])
+def test_pause_live_site_pipelines(settings, mocker, is_default_theme_site):
+    """pause_live_site_pipelines should pause the live pipeline and those of any extra themes"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    settings.OCW_DEFAULT_COURSE_THEME = "ocw-course-v2"
+    settings.OCW_EXTRA_COURSE_THEMES = ["ocw-course-v3", "ocw-course-v4"]
+    mock_get_pipeline = mocker.patch("content_sync.api.get_site_pipeline")
+    website = WebsiteFactory.create(
+        starter=WebsiteStarterFactory.create(slug="ocw-course-v2")
+        if is_default_theme_site
+        else WebsiteStarterFactory.create()
+    )
+    api.pause_live_site_pipelines(website)
+    mock_get_pipeline.assert_called_once_with(website)
+    paused = [
+        call.args[0]
+        for call in mock_get_pipeline.return_value.pause_pipeline.call_args_list
+    ]
+    assert paused == (
+        [VERSION_LIVE, f"{VERSION_LIVE}-ocw-course-v3", f"{VERSION_LIVE}-ocw-course-v4"]
+        if is_default_theme_site
+        else [VERSION_LIVE]
+    )
+
+
+def test_pause_live_site_pipelines_extra_theme_error(settings, mocker):
+    """A failure to pause an extra theme pipeline should be logged without stopping the others"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    settings.OCW_DEFAULT_COURSE_THEME = "ocw-course-v2"
+    settings.OCW_EXTRA_COURSE_THEMES = ["ocw-course-v3", "ocw-course-v4"]
+    mock_log = mocker.patch("content_sync.api.log")
+    mock_pipeline = mocker.patch("content_sync.api.get_site_pipeline").return_value
+    mock_pipeline.pause_pipeline.side_effect = [None, HTTPError("404"), None]
+    website = WebsiteFactory.create(
+        starter=WebsiteStarterFactory.create(slug="ocw-course-v2")
+    )
+    api.pause_live_site_pipelines(website)
+    assert mock_pipeline.pause_pipeline.call_count == 3
+    mock_log.exception.assert_called_once_with(
+        "Could not pause the %s pipeline for %s",
+        f"{VERSION_LIVE}-ocw-course-v3",
+        website.name,
+    )
+
+
+def test_pause_live_site_pipelines_live_error(settings, mocker):
+    """A failure to pause the main live pipeline should still be raised"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    mock_pipeline = mocker.patch("content_sync.api.get_site_pipeline").return_value
+    mock_pipeline.pause_pipeline.side_effect = HTTPError("404")
+    with pytest.raises(HTTPError):
+        api.pause_live_site_pipelines(WebsiteFactory.create())
+
+
+def test_sync_github_website_starters(mocker):
+    """Sync website starters from github"""
+    mock_task = mocker.patch("content_sync.api.tasks.sync_github_site_configs.delay")
+    args = "https://github.com/testorg/testconfigs", ["site1/studio.yaml"]
+    kwargs = {"commit": "abc123"}
+    api.sync_github_website_starters(*args, **kwargs)
+    mock_task.assert_called_once_with(*args, **kwargs)
+
+
+def test_sync_github_website_starters_with_tag(mocker):
+    """Sync website starters from github, passing the pushed tag on"""
+    mock_task = mocker.patch("content_sync.api.tasks.sync_github_site_configs.delay")
+    args = "https://github.com/testorg/testconfigs", []
+    kwargs = {"commit": "abc123", "tag": "2026.11.3.1"}
+    api.sync_github_website_starters(*args, **kwargs)
+    mock_task.assert_called_once_with(*args, **kwargs)
+
+
+def test_get_pipeline_api(settings, mocker):
+    """Verify that get_pipeline_api() imports the pipeline api class based on settings.py"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    import_string_mock = mocker.patch("content_sync.pipelines.concourse.PipelineApi")
+    api.get_pipeline_api()
+    import_string_mock.assert_called_once_with()
+
+
+@pytest.mark.parametrize("hugo_args", [None, "--baseURL /"])
+@pytest.mark.parametrize("pipeline_api", [None, {}])
+def test_get_site_pipeline(settings, mocker, hugo_args, pipeline_api):
+    """Verify that get_site_pipeline() imports the pipeline class based on settings.py"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    import_string_mock = mocker.patch("content_sync.pipelines.concourse.SitePipeline")
+    website = WebsiteFactory.create()
+    api.get_site_pipeline(website, hugo_args=hugo_args, api=pipeline_api)
+    import_string_mock.assert_any_call(
+        website,
+        hugo_args=hugo_args,
+        api=pipeline_api,
+        theme_slug=None,
+        prefix="",
+        noindex=None,
+    )
+
+
+@pytest.mark.parametrize("prepublish", [True, False])
+@pytest.mark.parametrize("prepublish_actions", [[], ["some.Action"]])
+@pytest.mark.parametrize("has_api", [True, False])
+@pytest.mark.parametrize("version", [VERSION_LIVE, VERSION_DRAFT])
+@pytest.mark.parametrize("status", [None, PUBLISH_STATUS_NOT_STARTED])
+@pytest.mark.parametrize("trigger", [True, False])
+@pytest.mark.parametrize("publish_date", [None, now_in_utc()])
+def test_publish_website(  # pylint:disable=redefined-outer-name,too-many-arguments  # noqa: PLR0913, PLR0917
+    settings,
+    mocker,
+    mock_api_funcs,
+    prepublish,
+    prepublish_actions,
+    has_api,
+    version,
+    status,
+    trigger,
+    publish_date,
+):
+    """Verify that the appropriate backend calls are made by the publish_website function"""
+    settings.PREPUBLISH_ACTIONS = prepublish_actions
+    website = WebsiteFactory.create(publish_date=publish_date)
+    setattr(website, f"{version}_publish_status", status)
+    setattr(website, f"has_unpublished_{version}", status == PUBLISH_STATUS_NOT_STARTED)
+
+    # In case a site is already published, the build_date is a point in time after
+    # the publish date. The timedelta is chosen arbitrarily here.
+    build_date = publish_date + timedelta(minutes=5) if publish_date else None
+    setattr(website, f"{version}_build_date", build_date)
+    if status:
+        setattr(website, f"{version}_publish_status_updated_on", now_in_utc())
+    website.save()
+    build_id = 123456
+    pipeline_api = mocker.Mock() if has_api else None
+    backend = mock_api_funcs.mock_get_backend.return_value
+    pipeline = mock_api_funcs.mock_get_pipeline.return_value
+    pipeline.trigger_pipeline_build.return_value = build_id
+    api.publish_website(
+        website.name,
+        version,
+        pipeline_api=pipeline_api,
+        prepublish=prepublish,
+        trigger_pipeline=trigger,
+    )
+    mock_api_funcs.mock_get_backend.assert_called_once_with(website)
+    backend.sync_all_content_to_backend.assert_called_once()
+    if version == VERSION_DRAFT:
+        backend.merge_backend_draft.assert_called_once()
+    else:
+        backend.merge_backend_live.assert_called_once()
+    website.refresh_from_db()
+    if trigger:
+        mock_api_funcs.mock_get_pipeline.assert_called_once_with(
+            website, api=pipeline_api
+        )
+        assert pipeline.upsert_pipeline.call_count == (0 if publish_date else 1)
+        pipeline.check_online_site_job_resources.assert_called_once_with(version)
+        pipeline.trigger_pipeline_build.assert_called_once_with(version)
+        pipeline.unpause_pipeline.assert_called_once_with(version)
+        assert getattr(website, f"latest_build_id_{version}") == build_id
+    else:
+        mock_api_funcs.mock_get_pipeline.assert_not_called()
+        pipeline.trigger_pipeline_build.assert_not_called()
+        pipeline.unpause_pipeline.assert_not_called()
+        pipeline.check_online_site_job_resources.assert_not_called()
+        assert getattr(website, f"latest_build_id_{version}") is None
+    assert getattr(website, f"has_unpublished_{version}") is False
+    assert getattr(website, f"{version}_last_published_by") is None
+    if len(prepublish_actions) > 0 and prepublish:
+        mock_api_funcs.mock_import_string.assert_any_call("some.Action")
+        mock_api_funcs.mock_import_string.return_value.assert_any_call(
+            website, version=version
+        )
+
+    # Verify that mass build site pipelines are updated in case this is the first publish
+    # attempt, which is indicated by the absence of a build date
+    if not build_date:
+        assert (
+            mock_api_funcs.mock_get_mass_build_pipeline.return_value.upsert_pipeline.call_count
+            == 2
+        )
+    else:
+        assert (
+            mock_api_funcs.mock_get_mass_build_pipeline.return_value.upsert_pipeline.call_count
+            == 0
+        )
+
+
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+def test_publish_website_sets_publish_date(mock_api_funcs, version):
+    """
+    publish_website should set the draft_publish_date or publish_date
+    when a site is published.
+    """
+
+    current_utc = now_in_utc()
+    website = WebsiteFactory.create(draft_publish_date=None, publish_date=None)
+    api.publish_website(website.name, version, trigger_pipeline=False)
+    website.refresh_from_db()
+    if version == VERSION_DRAFT:
+        assert website.publish_date is None
+        assert (
+            current_utc
+            <= website.draft_publish_date
+            <= current_utc + timedelta(minutes=1)
+        )
+    else:
+        assert website.draft_publish_date is None
+        assert current_utc <= website.publish_date <= current_utc + timedelta(minutes=1)
+
+
+def test_publish_website_error(mock_api_funcs, settings):
+    """Verify that the appropriate error handling occurs if publish_website throws an exception"""
+    settings.PREPUBLISH_ACTIONS = [["some.Action"]]
+    mock_api_funcs.mock_import_string.side_effect = Exception("error")
+    website = WebsiteFactory.create()
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        api.publish_website(website.name, VERSION_LIVE)
+    website.refresh_from_db()
+    mock_api_funcs.mock_get_backend.assert_not_called()
+    assert website.live_publish_status == PUBLISH_STATUS_ERRORED
+
+
+def test_get_mass_publish_pipeline_no_backend(settings):
+    """get_mass_build_sites_pipeline should return None if no backend is specified"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = None
+    assert api.get_mass_build_sites_pipeline(VERSION_DRAFT) is None
+
+
+def test_get_theme_assets_pipeline_no_backend(settings):
+    """get_theme_assets_pipeline should return None if no backend is specified"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = None
+    assert api.get_theme_assets_pipeline() is None
+
+
+def test_get_site_pipeline_no_backend(settings):
+    """get_site_pipeline should return None if no backend is specified"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = None
+    assert api.get_site_pipeline(WebsiteFactory.create()) is None
+
+
+def test_get_pipeline_api_no_backend(settings):
+    """get_general_pipeline should return None if no backend is specified"""
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = None
+    assert api.get_pipeline_api() is None
+
+
+@pytest.mark.parametrize("version", [VERSION_LIVE, VERSION_DRAFT])
+@pytest.mark.parametrize("publish_date", [None, now_in_utc()])
+def test_publish_website_with_extra_themes(settings, mocker, version, publish_date):
+    """publish_website should trigger extra theme pipelines for OCW course sites"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.TestBackend"
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    settings.OCW_DEFAULT_COURSE_THEME = "ocw-course-v2"
+    settings.OCW_EXTRA_COURSE_THEMES = ["ocw-course-v3", "ocw-course-v4"]
+    settings.PREPUBLISH_ACTIONS = []
+
+    mocker.patch("content_sync.api.get_sync_backend")
+    mock_get_pipeline = mocker.patch("content_sync.api.get_site_pipeline")
+    mocker.patch("content_sync.api.tasks.update_mass_build_pipelines_on_publish")
+
+    ocw_starter = WebsiteStarterFactory.create(slug="ocw-course-v2")
+    website = WebsiteFactory.create(starter=ocw_starter, publish_date=publish_date)
+
+    mock_pipeline = mocker.Mock()
+    mock_pipeline.trigger_pipeline_build.return_value = 12345
+    mock_get_pipeline.return_value = mock_pipeline
+
+    api.publish_website(website.name, version, trigger_pipeline=True)
+
+    assert mock_get_pipeline.call_count == 3
+
+    call_args_list = mock_get_pipeline.call_args_list
+
+    assert call_args_list[0][0][0] == website
+    assert call_args_list[0][1]["api"] is None
+
+    assert call_args_list[1][0][0] == website
+    assert call_args_list[1][1]["theme_slug"] == "ocw-course-v3"
+    assert call_args_list[1][1]["prefix"] == "ocw-course-v3"
+    assert call_args_list[1][1]["noindex"] is True
+
+    assert call_args_list[2][0][0] == website
+    assert call_args_list[2][1]["theme_slug"] == "ocw-course-v4"
+    assert call_args_list[2][1]["prefix"] == "ocw-course-v4"
+    assert call_args_list[2][1]["noindex"] is True
+
+    expected_upsert_calls = 0 if publish_date else 3
+    assert mock_pipeline.upsert_pipeline.call_count == expected_upsert_calls
+    assert mock_pipeline.unpause_pipeline.call_count == 3
+    assert mock_pipeline.check_online_site_job_resources.call_count == 3
+    assert mock_pipeline.trigger_pipeline_build.call_count == 3
+
+    unpause_calls = [
+        call[0][0] for call in mock_pipeline.unpause_pipeline.call_args_list
+    ]
+    trigger_calls = [
+        call[0][0] for call in mock_pipeline.trigger_pipeline_build.call_args_list
+    ]
+    check_resource_calls = [
+        call[0][0]
+        for call in mock_pipeline.check_online_site_job_resources.call_args_list
+    ]
+
+    assert version in unpause_calls
+    assert f"{version}-ocw-course-v3" in unpause_calls
+    assert f"{version}-ocw-course-v4" in unpause_calls
+
+    assert version in trigger_calls
+    assert f"{version}-ocw-course-v3" in trigger_calls
+    assert f"{version}-ocw-course-v4" in trigger_calls
+
+    assert version in check_resource_calls
+    assert f"{version}-ocw-course-v3" in check_resource_calls
+    assert f"{version}-ocw-course-v4" in check_resource_calls
+
+
+def test_publish_website_no_extra_themes_for_non_ocw_site(settings, mocker):
+    """publish_website should not trigger extra theme pipelines for non-OCW sites"""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.TestBackend"
+    settings.CONTENT_SYNC_PIPELINE_BACKEND = "concourse"
+    settings.OCW_DEFAULT_COURSE_THEME = "ocw-course-v2"
+    settings.OCW_EXTRA_COURSE_THEMES = ["ocw-course-v3"]
+    settings.PREPUBLISH_ACTIONS = []
+
+    mocker.patch("content_sync.api.get_sync_backend")
+    mock_get_pipeline = mocker.patch("content_sync.api.get_site_pipeline")
+    mocker.patch("content_sync.api.tasks.update_mass_build_pipelines_on_publish")
+
+    other_starter = WebsiteStarterFactory.create(slug="other-starter")
+    website = WebsiteFactory.create(starter=other_starter)
+
+    mock_pipeline = mocker.Mock()
+    mock_pipeline.trigger_pipeline_build.return_value = 12345
+    mock_get_pipeline.return_value = mock_pipeline
+
+    api.publish_website(website.name, VERSION_LIVE, trigger_pipeline=True)
+
+    assert mock_get_pipeline.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "rate_limit_status", [None, (5, 1000, now_in_utc() + timedelta(seconds=120))]
+)
+def test_throttle_git_backend_calls_gitlab(settings, mocker, rate_limit_status):
+    """throttle_git_backend_calls should apply GitLab throttling when configured."""
+    settings.GITLAB_RATE_LIMIT_CHECK = True
+    settings.GITLAB_RATE_LIMIT_CUTOFF = 100
+    settings.GITLAB_RATE_LIMIT_MIN_SLEEP = 7
+    sleep_mock = mocker.patch("content_sync.api.sleep")
+    backend = mocker.Mock(
+        rate_limit_name="gitlab",
+        rate_limit_check_setting="GITLAB_RATE_LIMIT_CHECK",
+        rate_limit_cutoff_setting="GITLAB_RATE_LIMIT_CUTOFF",
+        rate_limit_min_sleep_setting="GITLAB_RATE_LIMIT_MIN_SLEEP",
+    )
+    backend.get_rate_limit_status.return_value = rate_limit_status
+
+    api.throttle_git_backend_calls(backend)
+
+    if rate_limit_status is None:
+        sleep_mock.assert_called_once_with(7)
+    else:
+        assert sleep_mock.call_count == 1
+        assert sleep_mock.call_args_list[0][0][0] > 7

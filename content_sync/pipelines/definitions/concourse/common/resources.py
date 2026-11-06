@@ -1,0 +1,419 @@
+import os
+from urllib.parse import urljoin, urlparse
+
+from django.conf import settings
+from ol_concourse.lib.models.pipeline import Identifier, Resource, ResourceType
+from ol_concourse.lib.resource_types import (
+    fastly_resource_type,
+    slack_notification_resource,
+)
+from ol_concourse.lib.resources import fastly_service
+
+from content_sync.constants import VERSION_DRAFT, VERSION_LIVE
+from content_sync.pipelines.definitions.concourse.common.identifiers import (
+    FASTLY_RESOURCE_TYPE_IDENTIFIER,
+    HTTP_RESOURCE_TYPE_IDENTIFIER,
+    OCW_HUGO_PROJECTS_GIT_IDENTIFIER,
+    OCW_HUGO_THEMES_GIT_IDENTIFIER,
+    OCW_STUDIO_WEBHOOK_OFFLINE_GATE_IDENTIFIER,
+    OCW_STUDIO_WEBHOOK_RESOURCE_TYPE_IDENTIFIER,
+    S3_IAM_RESOURCE_TYPE_IDENTIFIER,
+    SLACK_ALERT_RESOURCE_IDENTIFIER,
+    get_fastly_identifier,
+    get_ocw_catalog_identifier,
+)
+from content_sync.utils import (
+    get_hugo_tag_regex,
+    get_ocw_studio_api_url,
+    get_s3_endpoint_url,
+)
+from websites.constants import OCW_HUGO_THEMES_GIT
+
+
+class SlackAlertResource(Resource):
+    """
+    A Resource using the version of concourse-slack-notification specified by ol-concourse
+
+    It sends messages to a Slack channel
+    """  # noqa: E501
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            name=SLACK_ALERT_RESOURCE_IDENTIFIER,
+            icon="slack",
+            type=slack_notification_resource().name,
+            check_every="never",
+            # Resolved by Concourse's Vault credential manager at runtime
+            # (concourse/ocw/slack-url). On dev there is no var source, so the
+            # put fails -- harmlessly, because every alert is raised through
+            # ErrorHandlingStep/SlackAlertStep, which wrap it in a TryStep.
+            # Do not substitute a literal here: that silently replaces the
+            # Vault lookup in QA and production too.
+            source={"url": "((slack-url))", "disabled": "false"},
+            **kwargs,
+        )
+
+
+class OpenCatalogResource(Resource):
+    """
+    A Resource that uses the http-resource ResourceType to trigger API calls to open catalog sites
+    """  # noqa: E501
+
+    def __init__(self, open_url, **kwargs):
+        super().__init__(
+            name=get_ocw_catalog_identifier(open_url),
+            icon="cloud-search",
+            type=HTTP_RESOURCE_TYPE_IDENTIFIER,
+            check_every="never",
+            source={
+                "url": f"{open_url}",
+                "method": "POST",
+                "out_only": True,
+                "headers": {
+                    "Content-Type": "application/json",
+                },
+            },
+            **kwargs,
+        )
+
+
+class GitResource(Resource):
+    """
+    A Resource for interacting with git repositories
+    """
+
+    def __init__(
+        self,
+        name: Identifier,
+        uri: str,
+        branch: str,
+        private_key: str | None = None,
+        tag_regex: str | None = None,
+        **kwagrs,
+    ):
+        # With a tag_regex the resource follows the newest matching tag, and a get
+        # clones that tag, instead of following the branch.
+        source = (
+            {
+                "uri": uri,
+                "version_type": "tags",
+                "tag_regex": tag_regex,
+                "tag_sort": "version",
+            }
+            if tag_regex
+            else {"uri": uri, "branch": branch}
+        )
+        super().__init__(
+            name=name,
+            icon="git",
+            type="git",
+            source=source,
+            **kwagrs,
+        )
+        if private_key:
+            self.source["private_key"] = private_key
+
+
+class OcwStudioWebhookResource(Resource):
+    """
+    A Resource for making API calls ocw-studio to set a Website's status
+
+    args:
+        site_name(str): The name of the site the status is in reference to
+        api_token(str): The ocw-studio API token
+    """
+
+    def __init__(
+        self,
+        site_name: str,
+        api_token: str,
+        **kwargs,
+    ):
+        ocw_studio_url = get_ocw_studio_api_url()
+        api_path = os.path.join(  # noqa: PTH118
+            "api", "websites", site_name, "pipeline_status"
+        )
+        api_url = f"{urljoin(ocw_studio_url, api_path)}/"
+        super().__init__(
+            name=OCW_STUDIO_WEBHOOK_RESOURCE_TYPE_IDENTIFIER,
+            icon="language-python",
+            type=HTTP_RESOURCE_TYPE_IDENTIFIER,
+            check_every="never",
+            source={
+                "url": api_url,
+                "method": "POST",
+                "out_only": True,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_token}",
+                },
+            },
+            **kwargs,
+        )
+
+
+class OcwStudioOfflineGateResource(Resource):
+    """
+    A Resource for making API calls to ocw-studio to check if a Website's
+    offline version is downloadable.
+
+    args:
+        site_name(str): The name of the site the status is in reference to
+        api_token(str): The ocw-studio API token
+    """
+
+    def __init__(
+        self,
+        site_name: str,
+        api_token: str,
+        **kwargs,
+    ):
+        ocw_studio_url = get_ocw_studio_api_url()
+        api_path = os.path.join(  # noqa: PTH118
+            "api", "websites", site_name, "hide_download"
+        )
+        api_url = f"{urljoin(ocw_studio_url, api_path)}/"
+        super().__init__(
+            name=OCW_STUDIO_WEBHOOK_OFFLINE_GATE_IDENTIFIER,
+            icon="language-python",
+            type=HTTP_RESOURCE_TYPE_IDENTIFIER,
+            check_every="never",
+            source={
+                "url": api_url,
+                "method": "GET",
+                "version": {"jq": ".version", "default": "none"},
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_token}",
+                },
+            },
+            **kwargs,
+        )
+
+
+class WebpackManifestResource(Resource):
+    """
+    A Resource for fetching the ocw-hugo-themes webpack manifest from S3
+
+    Args:
+        bucket(str): The S3 bucket to fetch the file from
+        branch(str): The branch of ocw-hugo-themes the webpack build was run on
+    """
+
+    def __init__(self, bucket: str, branch, **kwargs):
+        super().__init__(
+            type=S3_IAM_RESOURCE_TYPE_IDENTIFIER,
+            icon="file-cloud",
+            check_every="never",
+            source={
+                "bucket": bucket,
+                "versioned_file": f"ocw-hugo-themes/{branch}/webpack.json",
+                # Opt into the AWS SDK default credential chain so the resource
+                # picks up the worker's EC2 instance profile over IMDSv2. Without
+                # this the official s3-resource uses anonymous credentials. The
+                # dev overrides below take precedence when they are set.
+                "enable_aws_creds_provider": True,
+            },
+            **kwargs,
+        )
+        endpoint_url = get_s3_endpoint_url()
+        if endpoint_url:
+            self.source.update(
+                {
+                    "endpoint": endpoint_url,
+                    "access_key_id": (settings.AWS_ACCESS_KEY_ID or ""),
+                    "secret_access_key": (settings.AWS_SECRET_ACCESS_KEY or ""),
+                    # concourse/s3-resource defaults to virtual-host addressing,
+                    # so it resolves <bucket>.<endpoint host> -- a name that does
+                    # not exist for a local S3 emulator reached by service name.
+                    # The check fails with "no such host" and the job waits
+                    # forever on an input it can never get.
+                    "use_path_style": True,
+                }
+            )
+
+
+class OcwHugoThemesGitResource(GitResource):
+    """
+    A GitResource for fetching the ocw-hugo-themes git repository
+
+    Args:
+        branch(str): The branch of ocw-hugo-themes to fetch, or the release pointer
+            whose tag to fetch when settings.OCW_HUGO_TAG_RELEASES is on
+        tag_regex(str): The tag pattern to follow, for a caller whose branch is a
+            Concourse variable placeholder rather than the pointer itself
+    """
+
+    def __init__(self, branch: str, tag_regex: str | None = None, **kwargs):
+        super().__init__(
+            name=OCW_HUGO_THEMES_GIT_IDENTIFIER,
+            uri=OCW_HUGO_THEMES_GIT,
+            branch=branch,
+            tag_regex=tag_regex or get_hugo_tag_regex(branch),
+            check_every="never",
+            **kwargs,
+        )
+
+
+class OcwHugoProjectsGitResource(GitResource):
+    """
+    A GitResource for fetching the ocw-hugo-projcets git repository
+
+    Args:
+        branch(str): The branch of ocw-hugo-projects to fetch, or the release pointer
+            whose tag to fetch when settings.OCW_HUGO_TAG_RELEASES is on
+        tag_regex(str): The tag pattern to follow, for a caller whose branch is a
+            Concourse variable placeholder rather than the pointer itself
+    """
+
+    def __init__(self, uri: str, branch: str, tag_regex: str | None = None, **kwargs):
+        super().__init__(
+            name=OCW_HUGO_PROJECTS_GIT_IDENTIFIER,
+            uri=uri,
+            branch=branch,
+            tag_regex=tag_regex or get_hugo_tag_regex(branch),
+            check_every="never",
+            **kwargs,
+        )
+
+
+class SiteContentGitResource(GitResource):
+    """
+    A GitResource for fetching the site content git repository
+
+    Args:
+        branch(str): The branch of the site content repository to fetch
+        short_id(str): The short_id property of the Website
+    """
+
+    def __init__(self, branch: str, short_id: str, **kwargs):
+        if settings.CONCOURSE_IS_PRIVATE_REPO:
+            uri = (
+                f"git@{settings.GIT_DOMAIN}:{settings.GIT_ORGANIZATION}/{short_id}.git"
+            )
+            private_key = "((git-private-key))"
+        else:
+            uri = f"https://{settings.GIT_DOMAIN}/{settings.GIT_ORGANIZATION}/{short_id}.git"
+            private_key = None
+        super().__init__(
+            uri=uri,
+            branch=branch,
+            check_every="never",
+            private_key=private_key,
+            **kwargs,
+        )
+
+
+# The MIT Learn distribution serves ocw-course-v3 content. Only live content reaches
+# it, so it is purged alongside the live distribution and no other.
+FASTLY_PURPOSE_LEARN = "learn"
+# The distribution the e2e test pipeline publishes to. That pipeline runs under
+# pipeline_name "live" but purges this distribution, which is why the MIT Learn purge
+# is keyed off the Fastly purpose rather than the pipeline name.
+FASTLY_PURPOSE_TEST = "test"
+
+
+def get_fastly_domain(purpose: str) -> str | None:
+    """
+    Get the domain served by the Fastly distribution for a given purpose.
+
+    Args:
+        purpose(str): The distribution, e.g. "draft", "live", "test" or "learn"
+
+    Returns:
+        str | None: The domain, or None if none is configured for this environment
+    """
+    if purpose == FASTLY_PURPOSE_LEARN:
+        return settings.COURSE_V3_CANONICAL_DOMAIN or None
+    base_url = {
+        VERSION_DRAFT: settings.OCW_STUDIO_DRAFT_URL,
+        VERSION_LIVE: settings.OCW_STUDIO_LIVE_URL,
+        FASTLY_PURPOSE_TEST: settings.STATIC_API_BASE_URL_TEST,
+    }.get(purpose)
+    if not base_url:
+        return None
+    return urlparse(base_url).netloc or None
+
+
+def get_fastly_service_id(purpose: str) -> str:
+    """
+    Get the Fastly service ID for a given purpose.
+
+    Args:
+        purpose(str): The distribution, e.g. "draft", "live", "test" or "learn"
+
+    Returns:
+        str: The Concourse service ID variable, or an empty string for an unknown
+            purpose
+    """
+    return {
+        VERSION_DRAFT: "((fastly_draft.service_id))",
+        VERSION_LIVE: "((fastly_live.service_id))",
+        FASTLY_PURPOSE_LEARN: "((fastly_learn.service_id))",
+        FASTLY_PURPOSE_TEST: "((fastly_test.service_id))",
+    }.get(purpose, "")
+
+
+def get_fastly_purge_purposes(purpose: str) -> list[str]:
+    """
+    Get every distribution that a build for a given purpose must purge.
+
+    A distribution with no configured domain is omitted rather than raising, the same
+    way is_dev() omits cache clearing entirely. CI, for example, has no OCW Fastly
+    service at all.
+
+    This is the single source of truth for both the purge steps and the Fastly
+    resources a pipeline declares, so the two cannot drift apart.
+
+    Args:
+        purpose(str): The distribution being published to, e.g. "draft" or "live"
+
+    Returns:
+        list[str]: The distributions to purge, the given purpose first
+    """
+    purposes = [purpose]
+    if purpose == VERSION_LIVE:
+        purposes.append(FASTLY_PURPOSE_LEARN)
+    return [item for item in purposes if get_fastly_domain(item)]
+
+
+def fastly_resource_types(resources: list[Resource]) -> list[ResourceType]:
+    """
+    Get the ResourceType definitions required by any Fastly resources in a list.
+
+    Derived from the resources themselves so a pipeline can never declare the
+    resource type without the resources, or the resources without the type.
+
+    Args:
+        resources(list[Resource]): The resources a pipeline declares
+
+    Returns:
+        list[ResourceType]: The Fastly resource type, or empty if none is needed
+    """
+    if any(resource.type == FASTLY_RESOURCE_TYPE_IDENTIFIER for resource in resources):
+        return [fastly_resource_type()]
+    return []
+
+
+def fastly_resources(purpose: str) -> list[Resource]:
+    """
+    Build the Fastly resources a pipeline publishing to a given purpose must declare.
+
+    Args:
+        purpose(str): The distribution being published to, e.g. "draft" or "live"
+
+    Returns:
+        list[Resource]: One Fastly resource per distribution that will be purged
+    """
+    return [
+        fastly_service(
+            name=get_fastly_identifier(item),
+            api_token=settings.CONCOURSE_FASTLY_API_TOKEN_VAR,
+            service_id=get_fastly_service_id(item),
+            domain=get_fastly_domain(item),
+            # Purge-only: never poll Fastly for VCL version changes. The library
+            # default of "1h" would have every site pipeline instance polling.
+            check_every="never",
+        )
+        for item in get_fastly_purge_purposes(purpose)
+    ]

@@ -1,0 +1,45 @@
+@mixin unstyled-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+
+  li {
+    &:first-child {
+      margin-top: 0 !important;
+    }
+
+    &:last-child {
+      margin-bottom: 0 !important;
+    }
+  }
+}
+
+.ruled-list {
+  @include unstyled-list;
+
+  li {
+    &:not(:last-child) {
+      border-bottom: 1px solid $studio-gray;
+    }
+  }
+}
+
+// A class we use for any list of items on the site
+// (i.e. sites on `/sites`, pieces of site content on
+// `/site/$sitename/type/$contenttype`, etc)
+ul.studio-list {
+  @include unstyled-list;
+
+  /* stylelint-disable no-descending-specificity */
+  li {
+    .title {
+      font-size: 18px;
+      font-weight: 500;
+      text-decoration: underline;
+    }
+
+    .subtitle {
+      font-size: 14px;
+    }
+  }
+}

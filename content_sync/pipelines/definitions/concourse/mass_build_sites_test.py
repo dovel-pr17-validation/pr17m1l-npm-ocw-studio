@@ -1,0 +1,553 @@
+import json
+import os
+from urllib.parse import quote, urljoin
+
+import pytest
+from ol_concourse.lib.resource_types import (
+    fastly_resource_type,
+    slack_notification_resource,
+)
+
+from content_sync.constants import (
+    DEV_ENDPOINT_URL,
+    OCW_HUGO_PRODUCTION_TAG_REGEX,
+    VERSION_DRAFT,
+    VERSION_LIVE,
+)
+from content_sync.pipelines.definitions.concourse.common.identifiers import (
+    HTTP_RESOURCE_TYPE_IDENTIFIER,
+    KEYVAL_RESOURCE_TYPE_IDENTIFIER,
+    MASS_BUILD_SITES_BATCH_GATE_IDENTIFIER,
+    MASS_BUILD_SITES_JOB_IDENTIFIER,
+    OCW_HUGO_PROJECTS_GIT_IDENTIFIER,
+    OCW_HUGO_PROJECTS_GIT_TRIGGER_IDENTIFIER,
+    OCW_HUGO_THEMES_GIT_IDENTIFIER,
+    OCW_STUDIO_WEBHOOK_RESOURCE_TYPE_IDENTIFIER,
+    S3_IAM_RESOURCE_TYPE_IDENTIFIER,
+    SITE_CONTENT_GIT_IDENTIFIER,
+    SLACK_ALERT_RESOURCE_IDENTIFIER,
+    STATIC_RESOURCES_S3_IDENTIFIER,
+    WEBPACK_MANIFEST_S3_IDENTIFIER,
+    WEBPACK_MANIFEST_S3_TRIGGER_IDENTIFIER,
+    get_fastly_identifier,
+)
+from content_sync.pipelines.definitions.concourse.common.resources import (
+    FASTLY_PURPOSE_LEARN,
+)
+from content_sync.pipelines.definitions.concourse.mass_build_sites import (
+    MassBuildSitesPipelineDefinition,
+    MassBuildSitesPipelineDefinitionConfig,
+)
+from content_sync.pipelines.definitions.concourse.site_pipeline import (
+    FILTER_WEBPACK_ARTIFACTS_IDENTIFIER,
+    UPLOAD_ONLINE_BUILD_IDENTIFIER,
+    SitePipelineDefinitionConfig,
+    get_site_pipeline_definition_vars,
+)
+from content_sync.utils import get_ocw_studio_api_url, get_site_content_branch
+from main.utils import get_dict_list_item_by_field
+from websites.constants import OCW_HUGO_THEMES_GIT
+
+pytestmark = pytest.mark.django_db
+total_sites = 6
+ocw_hugo_projects_path = "https://github.com/org/repo"
+
+
+@pytest.mark.parametrize("version", [VERSION_DRAFT, VERSION_LIVE])
+@pytest.mark.parametrize("ocw_hugo_themes_branch", ["main", "test_branch"])
+@pytest.mark.parametrize("ocw_hugo_projects_branch", ["main", "test_branch"])
+@pytest.mark.parametrize("env_name", ["dev", "prod"])
+@pytest.mark.parametrize("concourse_is_private_repo", [True, False])
+@pytest.mark.parametrize("offline", [True, False])
+@pytest.mark.parametrize("is_dev", [True, False])
+@pytest.mark.parametrize(
+    "prefix", ["", "test_prefix", "/test_prefix", "/test_prefix/subfolder/"]
+)
+def test_generate_mass_build_sites_definition(  # noqa: C901, PLR0913, PLR0912, PLR0915, PLR0917
+    mass_build_websites,
+    settings,
+    mocker,
+    version,
+    ocw_hugo_themes_branch,
+    ocw_hugo_projects_branch,
+    env_name,
+    concourse_is_private_repo,
+    offline,
+    is_dev,
+    prefix,
+):
+    """
+    The site pipeline definition should contain the expected properties
+    """
+    settings.AWS_ACCESS_KEY_ID = "test_access_key_id"
+    settings.AWS_SECRET_ACCESS_KEY = "test_secret_access_key"  # noqa: S105
+    settings.CONCOURSE_IS_PRIVATE_REPO = concourse_is_private_repo
+    settings.OCW_HUGO_THEMES_SENTRY_DSN = "test_sentry_dsn"
+    settings.ROOT_WEBSITE_NAME = "root-website"
+    settings.OCW_MASS_BUILD_BATCH_SIZE = 2
+    settings.OCW_MASS_BUILD_MAX_IN_FLIGHT = 2
+    settings.ENV_NAME = env_name
+    batch_count = total_sites / settings.OCW_MASS_BUILD_BATCH_SIZE
+    mock_is_dev = mocker.patch(
+        "content_sync.pipelines.definitions.concourse.site_pipeline.is_dev"
+    )
+    mock_is_dev.return_value = is_dev
+    mock_mass_build_is_dev = mocker.patch(
+        "content_sync.pipelines.definitions.concourse.mass_build_sites.is_dev"
+    )
+    mock_mass_build_is_dev.return_value = is_dev
+    site_content_branch = get_site_content_branch(version)
+    artifacts_bucket = settings.AWS_ARTIFACTS_BUCKET_NAME
+    web_bucket = (
+        settings.AWS_PREVIEW_BUCKET_NAME
+        if version == VERSION_DRAFT
+        else settings.AWS_PUBLISH_BUCKET_NAME
+    )
+    offline_bucket = (
+        settings.AWS_OFFLINE_PREVIEW_BUCKET_NAME
+        if version == VERSION_DRAFT
+        else settings.AWS_OFFLINE_PUBLISH_BUCKET_NAME
+    )
+    instance_vars = f"?vars={quote(json.dumps({'offline': False, 'prefix': '', 'projects_branch': 'main', 'themes_branch': 'main', 'starter': '', 'version': 'draft'}))}"
+    ocw_hugo_projects_url = f"{ocw_hugo_projects_path}.git"
+    ocw_studio_url = get_ocw_studio_api_url()
+    site_pipeline_vars = get_site_pipeline_definition_vars(namespace=".:site.")
+    pipeline_config = MassBuildSitesPipelineDefinitionConfig(
+        version=version,
+        artifacts_bucket=artifacts_bucket,
+        site_content_branch=site_content_branch,
+        ocw_hugo_themes_branch=ocw_hugo_themes_branch,
+        ocw_hugo_projects_branch=ocw_hugo_projects_branch,
+        offline=offline,
+        instance_vars=instance_vars,
+        prefix=prefix,
+    )
+    pipeline_definition = MassBuildSitesPipelineDefinition(config=pipeline_config)
+    rendered_definition = json.loads(pipeline_definition.json(indent=2, by_alias=True))
+
+    # Assert that the expected resource types exist
+    expected_resource_types = [
+        HTTP_RESOURCE_TYPE_IDENTIFIER,
+        KEYVAL_RESOURCE_TYPE_IDENTIFIER,
+        S3_IAM_RESOURCE_TYPE_IDENTIFIER,
+        slack_notification_resource().name,
+        fastly_resource_type().name,
+    ]
+    for resource_type in rendered_definition["resource_types"]:
+        assert resource_type["name"] in expected_resource_types
+
+    if not is_dev:
+        # A live mass build purges the live distribution and MIT Learn, which also serves
+        # this content. A draft mass build purges only the draft distribution.
+        expected_fastly_resources = (
+            [
+                get_fastly_identifier(VERSION_LIVE),
+                get_fastly_identifier(FASTLY_PURPOSE_LEARN),
+            ]
+            if version == VERSION_LIVE
+            else [get_fastly_identifier(VERSION_DRAFT)]
+        )
+        fastly_resource_names = [
+            resource["name"]
+            for resource in rendered_definition["resources"]
+            if resource["type"] == fastly_resource_type().name
+        ]
+        assert fastly_resource_names == expected_fastly_resources
+        for resource in rendered_definition["resources"]:
+            if resource["type"] == fastly_resource_type().name:
+                assert resource["check_every"] == "never"
+        purge_steps = [
+            step
+            for job in rendered_definition["jobs"]
+            for step in _iter_steps(job["plan"])
+            if step.get("resource") in expected_fastly_resources
+        ]
+        assert purge_steps
+        for purge_step in purge_steps:
+            # The surrogate key is an across var Concourse resolves at runtime, so it
+            # must survive into the put params verbatim
+            assert purge_step["params"]["surrogate_key"] == "((.:site.site_name))"
+            assert purge_step["no_get"] is True
+
+    # Assert that the expected resources exist and have the expected properties
+    resources = rendered_definition["resources"]
+    webpack_manifest_s3_resource = get_dict_list_item_by_field(
+        items=resources, field="name", value=WEBPACK_MANIFEST_S3_IDENTIFIER
+    )
+    assert webpack_manifest_s3_resource["source"]["bucket"] == artifacts_bucket
+    assert (
+        webpack_manifest_s3_resource["source"]["versioned_file"]
+        == f"ocw-hugo-themes/{ocw_hugo_themes_branch}/webpack.json"
+    )
+    if is_dev:
+        assert webpack_manifest_s3_resource["source"]["endpoint"] == DEV_ENDPOINT_URL
+        assert (
+            webpack_manifest_s3_resource["source"]["access_key_id"]
+            == settings.AWS_ACCESS_KEY_ID
+        )
+        assert (
+            webpack_manifest_s3_resource["source"]["secret_access_key"]
+            == settings.AWS_SECRET_ACCESS_KEY
+        )
+    else:
+        assert not hasattr(webpack_manifest_s3_resource["source"], "endpoint")
+        assert not hasattr(webpack_manifest_s3_resource["source"], "access_key_id")
+        assert not hasattr(webpack_manifest_s3_resource["source"], "secret_access_key")
+    ocw_hugo_themes_git_resource = get_dict_list_item_by_field(
+        items=resources, field="name", value=OCW_HUGO_THEMES_GIT_IDENTIFIER
+    )
+    assert ocw_hugo_themes_git_resource["source"]["uri"] == OCW_HUGO_THEMES_GIT
+    assert ocw_hugo_themes_git_resource["source"]["branch"] == ocw_hugo_themes_branch
+    ocw_hugo_projects_git_resource = get_dict_list_item_by_field(
+        items=resources, field="name", value=OCW_HUGO_PROJECTS_GIT_IDENTIFIER
+    )
+    assert ocw_hugo_projects_git_resource["source"]["uri"] == ocw_hugo_projects_url
+    assert (
+        ocw_hugo_projects_git_resource["source"]["branch"] == ocw_hugo_projects_branch
+    )
+    ocw_studio_webhook_resource = get_dict_list_item_by_field(
+        items=resources, field="name", value=OCW_STUDIO_WEBHOOK_RESOURCE_TYPE_IDENTIFIER
+    )
+    expected_api_path = os.path.join(  # noqa: PTH118
+        "api", "websites", site_pipeline_vars["site_name"], "pipeline_status"
+    )
+    expected_api_url = urljoin(ocw_studio_url, expected_api_path)
+    assert ocw_studio_webhook_resource["source"]["url"] == f"{expected_api_url}/"
+    assert (
+        ocw_studio_webhook_resource["source"]["headers"]["Authorization"]
+        == f"Bearer {settings.API_BEARER_TOKEN}"
+    )
+    assert (
+        get_dict_list_item_by_field(
+            items=resources, field="name", value=SLACK_ALERT_RESOURCE_IDENTIFIER
+        )
+        is not None
+    )
+    expected_batch_gates_amount = (
+        int(total_sites / settings.OCW_MASS_BUILD_BATCH_SIZE) - 1
+    )
+    for batch_number in range(expected_batch_gates_amount):
+        batch_gate = get_dict_list_item_by_field(
+            items=resources,
+            field="name",
+            value=f"{MASS_BUILD_SITES_BATCH_GATE_IDENTIFIER}-{batch_number + 1}",
+        )
+        assert batch_gate["type"] == KEYVAL_RESOURCE_TYPE_IDENTIFIER
+
+    # Assert that expected steps exist
+    jobs = rendered_definition["jobs"]
+    batch_number = 1
+    for job in jobs:
+        assert job["name"] == f"{MASS_BUILD_SITES_JOB_IDENTIFIER}-batch-{batch_number}"
+        steps = job["plan"]
+        assert (
+            get_dict_list_item_by_field(
+                items=steps, field="get", value=WEBPACK_MANIFEST_S3_IDENTIFIER
+            )
+            is not None
+        )
+        assert (
+            get_dict_list_item_by_field(
+                items=steps, field="get", value=OCW_HUGO_THEMES_GIT_IDENTIFIER
+            )
+            is not None
+        )
+        assert (
+            get_dict_list_item_by_field(
+                items=steps, field="get", value=OCW_HUGO_PROJECTS_GIT_IDENTIFIER
+            )
+            is not None
+        )
+        if offline:
+            assert (
+                get_dict_list_item_by_field(
+                    items=steps, field="task", value=FILTER_WEBPACK_ARTIFACTS_IDENTIFIER
+                )
+                is not None
+            )
+        if batch_number > 1:
+            assert (
+                get_dict_list_item_by_field(
+                    items=steps,
+                    field="get",
+                    value=f"{MASS_BUILD_SITES_BATCH_GATE_IDENTIFIER}-{batch_number - 1}",
+                )
+                is not None
+            )
+        for step in steps:
+            if "across" in step:
+                across_vars = step["across"][0]
+                assert across_vars["var"] == "site"
+                for across_values in across_vars["values"]:
+                    site = next(
+                        s
+                        for s in mass_build_websites
+                        if s.short_id == across_values["short_id"]
+                    )
+                    site_config = SitePipelineDefinitionConfig(
+                        site=site,
+                        pipeline_name=version,
+                        instance_vars=across_values["instance_vars"],
+                        site_content_branch=site_content_branch,
+                        static_api_url="test",
+                        storage_bucket=settings.AWS_STORAGE_BUCKET_NAME,
+                        artifacts_bucket=artifacts_bucket,
+                        web_bucket=web_bucket,
+                        offline_bucket=offline_bucket,
+                        resource_base_url="",
+                        ocw_hugo_themes_branch=ocw_hugo_themes_branch,
+                        ocw_hugo_projects_branch=ocw_hugo_projects_branch,
+                        hugo_override_args="",
+                        prefix=across_values.get("prefix", ""),
+                        namespace=".:site.",
+                    )
+                    assert across_values["site_name"] == site.name
+                    assert across_values["s3_path"] == site.s3_path
+                    assert across_values["url_path"] == site_config.url_path
+                    assert across_values["base_url"] == site_config.base_url
+                    assert (
+                        across_values["static_resources_subdirectory"]
+                        == site_config.static_resources_subdirectory
+                    )
+                    assert across_values["delete_flag"] == site_config.delete_flag
+                    assert across_values["noindex"] == site_config.noindex
+                    assert across_values["pipeline_name"] == version
+                    assert (
+                        across_values["storage_bucket"]
+                        == settings.AWS_STORAGE_BUCKET_NAME
+                    )
+                    assert across_values["artifacts_bucket"] == artifacts_bucket
+                    assert across_values["web_bucket"] == web_bucket
+                    assert across_values["offline_bucket"] == offline_bucket
+                    assert across_values["site_content_branch"] == site_content_branch
+                    assert (
+                        across_values["ocw_hugo_themes_branch"]
+                        == ocw_hugo_themes_branch
+                    )
+                    assert (
+                        across_values["ocw_hugo_projects_url"] == ocw_hugo_projects_url
+                    )
+                    assert (
+                        across_values["ocw_hugo_projects_branch"]
+                        == ocw_hugo_projects_branch
+                    )
+                    assert (
+                        across_values["hugo_args_online"]
+                        == site_config.hugo_args_online
+                    )
+                    assert (
+                        across_values["hugo_args_offline"]
+                        == site_config.hugo_args_offline
+                    )
+                    assert across_values["prefix"] == site_config.prefix
+                    assert (
+                        across_values["course_v3_canonical_domain"]
+                        == settings.COURSE_V3_CANONICAL_DOMAIN
+                    )
+                build_steps = step["do"]
+                site_content_git_step = get_dict_list_item_by_field(
+                    items=build_steps,
+                    field="task",
+                    value=SITE_CONTENT_GIT_IDENTIFIER,
+                )
+                site_content_git_command = site_content_git_step["config"]["run"][
+                    "args"
+                ][1]
+                if concourse_is_private_repo:
+                    assert (
+                        f"git@{settings.GIT_DOMAIN}:{settings.GIT_ORGANIZATION}/{site_config.vars['short_id']}.git"
+                        in site_content_git_command
+                    )
+                static_resources_s3_step = get_dict_list_item_by_field(
+                    items=build_steps,
+                    field="task",
+                    value=STATIC_RESOURCES_S3_IDENTIFIER,
+                )
+                static_resources_s3_command = "\n".join(
+                    static_resources_s3_step["config"]["run"]["args"]
+                )
+                if offline:
+                    assert "--exclude *.mp4" not in static_resources_s3_command
+                else:
+                    assert "--exclude *.mp4" in static_resources_s3_command
+                if not offline:
+                    upload_online_build_task = get_dict_list_item_by_field(
+                        items=build_steps,
+                        field="task",
+                        value=UPLOAD_ONLINE_BUILD_IDENTIFIER,
+                    )
+                    upload_online_build_command = "\n".join(
+                        upload_online_build_task["config"]["run"]["args"]
+                    )
+                    # The root website branch always syncs per-directory with --delete
+                    assert "--delete" in upload_online_build_command
+                    # By default the non-root sync must not carry the delete flag
+                    assert (
+                        site_pipeline_vars["delete_flag"]
+                        not in upload_online_build_command
+                    )
+                    assert "--exclude='*.mp4'" in upload_online_build_command
+        if batch_number < batch_count:
+            batch_gate = get_dict_list_item_by_field(
+                items=steps,
+                field="put",
+                value=f"{MASS_BUILD_SITES_BATCH_GATE_IDENTIFIER}-{batch_number}",
+            )
+            assert batch_gate is not None
+            assert batch_gate["no_get"] is True
+        batch_number += 1
+
+
+@pytest.mark.parametrize("sync_with_delete", [True, False])
+def test_mass_build_sites_definition_sync_with_delete(
+    mass_build_websites,
+    settings,
+    sync_with_delete,
+):
+    """The non-root online sync should only carry the delete flag when sync_with_delete is set"""
+    settings.ROOT_WEBSITE_NAME = "root-website"
+    settings.OCW_MASS_BUILD_BATCH_SIZE = 2
+    settings.OCW_MASS_BUILD_MAX_IN_FLIGHT = 2
+    site_pipeline_vars = get_site_pipeline_definition_vars(namespace=".:site.")
+    pipeline_config = MassBuildSitesPipelineDefinitionConfig(
+        version=VERSION_LIVE,
+        artifacts_bucket=settings.AWS_ARTIFACTS_BUCKET_NAME,
+        site_content_branch=get_site_content_branch(VERSION_LIVE),
+        ocw_hugo_themes_branch="main",
+        ocw_hugo_projects_branch="main",
+        offline=False,
+        instance_vars="",
+        sync_with_delete=sync_with_delete,
+    )
+    pipeline_definition = MassBuildSitesPipelineDefinition(config=pipeline_config)
+    rendered_definition = json.loads(pipeline_definition.json(indent=2, by_alias=True))
+    upload_online_build_tasks = 0
+    for job in rendered_definition["jobs"]:
+        for step in job["plan"]:
+            if "across" not in step:
+                continue
+            upload_online_build_task = get_dict_list_item_by_field(
+                items=step["do"],
+                field="task",
+                value=UPLOAD_ONLINE_BUILD_IDENTIFIER,
+            )
+            upload_online_build_tasks += 1
+            command = "\n".join(upload_online_build_task["config"]["run"]["args"])
+            if sync_with_delete:
+                assert site_pipeline_vars["delete_flag"] in command
+            else:
+                assert site_pipeline_vars["delete_flag"] not in command
+            # mp4 files are filtered out of the mass build static resources
+            # download, so they must also be excluded from the delete sync
+            assert "--exclude='*.mp4'" in command
+    assert upload_online_build_tasks > 0
+
+    # A destructive (sync_with_delete) instance must never auto-trigger on an
+    # unrelated themes/projects push - it can only run via an explicit trigger
+    first_batch_steps = rendered_definition["jobs"][0]["plan"]
+    webpack_trigger_step = get_dict_list_item_by_field(
+        items=first_batch_steps,
+        field="get",
+        value=WEBPACK_MANIFEST_S3_TRIGGER_IDENTIFIER,
+    )
+    projects_trigger_step = get_dict_list_item_by_field(
+        items=first_batch_steps,
+        field="get",
+        value=OCW_HUGO_PROJECTS_GIT_TRIGGER_IDENTIFIER,
+    )
+    expected_trigger = not sync_with_delete
+    assert webpack_trigger_step["trigger"] == expected_trigger
+    assert projects_trigger_step["trigger"] == expected_trigger
+
+
+@pytest.mark.parametrize("offline", [True, False])
+@pytest.mark.parametrize("theme_slug", ["", "ocw-course-v3"])
+def test_mass_build_sites_definition_extra_theme_sites(
+    mass_build_websites,
+    settings,
+    offline,
+    theme_slug,
+):
+    """An extra theme mass build should only build sites using the default course theme"""
+    settings.ROOT_WEBSITE_NAME = "root-website"
+    settings.OCW_DEFAULT_COURSE_THEME = "mass-build-test-starter-999"
+    settings.OCW_EXTRA_COURSE_THEMES = ["ocw-course-v3"]
+    pipeline_config = MassBuildSitesPipelineDefinitionConfig(
+        version=VERSION_LIVE,
+        artifacts_bucket=settings.AWS_ARTIFACTS_BUCKET_NAME,
+        site_content_branch=get_site_content_branch(VERSION_LIVE),
+        ocw_hugo_themes_branch="main",
+        ocw_hugo_projects_branch="main",
+        offline=offline,
+        instance_vars="",
+        theme_slug=theme_slug,
+    )
+    pipeline_definition = MassBuildSitesPipelineDefinition(config=pipeline_config)
+    rendered_definition = json.loads(pipeline_definition.json(indent=2, by_alias=True))
+    built_site_names = {
+        site["site_name"]
+        for job in rendered_definition["jobs"]
+        for step in job["plan"]
+        if "across" in step
+        for site in step["across"][0]["values"]
+    }
+    expected_site_names = {
+        site.name
+        for site in mass_build_websites
+        if not theme_slug or site.starter.slug == settings.OCW_DEFAULT_COURSE_THEME
+    }
+    assert built_site_names == expected_site_names
+    assert ("root-website" in built_site_names) is not bool(theme_slug)
+
+
+def _iter_steps(steps):
+    """Yield every step in a job plan, descending into across/do/try wrappers"""
+    for step in steps:
+        yield step
+        for key in ("do", "try"):
+            nested = step.get(key)
+            if isinstance(nested, list):
+                yield from _iter_steps(nested)
+            elif isinstance(nested, dict):
+                yield from _iter_steps([nested])
+
+
+def test_mass_build_sites_follow_release_tags(mass_build_websites, settings, mocker):
+    """With tag releases on, the themes and projects resources follow release tags, and the S3 key is still the pointer"""
+    settings.OCW_HUGO_TAG_RELEASES = True
+    settings.ROOT_WEBSITE_NAME = "root-website"
+    mocker.patch("content_sync.utils.is_dev", return_value=False)
+    pipeline_config = MassBuildSitesPipelineDefinitionConfig(
+        version=VERSION_LIVE,
+        artifacts_bucket=settings.AWS_ARTIFACTS_BUCKET_NAME,
+        site_content_branch=get_site_content_branch(VERSION_LIVE),
+        ocw_hugo_themes_branch="release",
+        ocw_hugo_projects_branch="release",
+        offline=False,
+        instance_vars="",
+        prefix="",
+    )
+    rendered_definition = json.loads(
+        MassBuildSitesPipelineDefinition(config=pipeline_config).json(
+            indent=2, by_alias=True
+        )
+    )
+    resources = rendered_definition["resources"]
+    for name in (
+        OCW_HUGO_THEMES_GIT_IDENTIFIER,
+        OCW_HUGO_PROJECTS_GIT_IDENTIFIER,
+        OCW_HUGO_PROJECTS_GIT_TRIGGER_IDENTIFIER,
+    ):
+        source = get_dict_list_item_by_field(items=resources, field="name", value=name)[
+            "source"
+        ]
+        assert source["version_type"] == "tags", name
+        assert source["tag_regex"] == OCW_HUGO_PRODUCTION_TAG_REGEX, name
+        assert "branch" not in source, name
+    webpack_manifest = get_dict_list_item_by_field(
+        items=resources, field="name", value=WEBPACK_MANIFEST_S3_IDENTIFIER
+    )
+    assert (
+        webpack_manifest["source"]["versioned_file"]
+        == "ocw-hugo-themes/release/webpack.json"
+    )

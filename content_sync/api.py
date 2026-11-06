@@ -1,0 +1,322 @@
+"""Syncing API"""
+
+import logging
+from datetime import datetime, timedelta
+from time import sleep
+from typing import TYPE_CHECKING
+
+import pytz
+from django.conf import settings
+from django.utils.module_loading import import_string
+from mitol.common.utils import now_in_utc
+from requests import HTTPError
+
+from content_sync import tasks
+from content_sync.backends.base import BaseSyncBackend
+from content_sync.constants import VERSION_DRAFT, VERSION_LIVE
+from content_sync.decorators import is_publish_pipeline_enabled, is_sync_enabled
+from content_sync.models import ContentSyncState
+from content_sync.utils import get_extra_course_themes
+from websites.constants import PUBLISH_STATUS_ERRORED, PUBLISH_STATUS_NOT_STARTED
+from websites.models import Website, WebsiteContent
+
+if TYPE_CHECKING:
+    from content_sync.backends.base import BaseSyncBackend
+    from content_sync.pipelines.base import BasePipeline
+
+log = logging.getLogger()
+
+
+def upsert_content_sync_state(content: WebsiteContent):
+    """Create or update the content sync state"""
+    ContentSyncState.objects.update_or_create(
+        content=content, defaults={"current_checksum": content.calculate_checksum()}
+    )
+
+
+def get_sync_backend(website: Website) -> BaseSyncBackend:
+    """Get the configured sync backend"""
+    return import_string(settings.CONTENT_SYNC_BACKEND)(website)
+
+
+@is_publish_pipeline_enabled
+def get_pipeline_api() -> BasePipeline:
+    """Get the base backend pipeline"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.PipelineApi"
+    )()
+
+
+@is_publish_pipeline_enabled
+def get_site_pipeline(  # noqa: PLR0913, PLR0917
+    website: Website,
+    hugo_args: str | None = "",
+    api: object | None = None,
+    theme_slug: str | None = None,
+    prefix: str = "",
+    noindex: bool | None = None,  # noqa: FBT001
+) -> BasePipeline:
+    """Get the configured sync publishing pipeline"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.SitePipeline"
+    )(
+        website,
+        hugo_args=hugo_args,
+        api=api,
+        theme_slug=theme_slug,
+        prefix=prefix,
+        noindex=noindex,
+    )
+
+
+@is_publish_pipeline_enabled
+def pause_live_site_pipelines(website: Website):
+    """Pause the live site pipeline of a website, plus those of its extra themes"""
+    pipeline = get_site_pipeline(website)
+    pipeline.pause_pipeline(VERSION_LIVE)
+    for theme_slug in get_extra_course_themes(website):
+        theme_pipeline_name = f"{VERSION_LIVE}-{theme_slug}"
+        try:
+            # Extra theme pipelines share the site's instance vars, only names differ
+            pipeline.pause_pipeline(theme_pipeline_name)
+        except HTTPError:
+            # A missing extra theme pipeline should not stop the unpublish
+            log.exception(
+                "Could not pause the %s pipeline for %s",
+                theme_pipeline_name,
+                website.name,
+            )
+
+
+@is_publish_pipeline_enabled
+def get_theme_assets_pipeline(
+    themes_branch: str | None = None, api: object | None = None
+) -> BasePipeline:
+    """Get the configured theme asset pipeline"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.ThemeAssetsPipeline"
+    )(themes_branch=themes_branch, api=api)
+
+
+@is_publish_pipeline_enabled
+def get_test_pipeline(
+    themes_branch: str | None = None,
+    projects_branch: str | None = None,
+    api: object | None = None,
+) -> BasePipeline:
+    """Get the configured end to end testing pipeline"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.TestPipeline"
+    )(themes_branch=themes_branch, projects_branch=projects_branch, api=api)
+
+
+@is_publish_pipeline_enabled
+def get_mass_build_sites_pipeline(  # pylint:disable=too-many-arguments  # noqa: PLR0913
+    version: str,
+    *,
+    api: object | None = None,
+    prefix: str | None = "",
+    themes_branch: str | None = "",
+    projects_branch: str | None = "",
+    starter: str | None = "",
+    offline: bool | None = False,
+    hugo_args: str | None = "",
+    theme_slug: str | None = "",
+    sync_with_delete: bool = False,
+) -> object:
+    """Get the mass build sites pipeline if the backend has one"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.MassBuildSitesPipeline"
+    )(
+        version,
+        api=api,
+        prefix=prefix,
+        themes_branch=themes_branch,
+        projects_branch=projects_branch,
+        starter=starter,
+        offline=offline,
+        hugo_args=hugo_args,
+        theme_slug=theme_slug,
+        sync_with_delete=sync_with_delete,
+    )
+
+
+@is_publish_pipeline_enabled
+def get_unpublished_removal_pipeline(api: object | None = None) -> object:
+    """Get the unpublished sites removal pipeline if the backend has one"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.UnpublishedSiteRemovalPipeline"
+    )(api=api)
+
+
+@is_publish_pipeline_enabled
+def get_s3_bucket_sync_pipeline(api: object | None = None) -> BasePipeline:
+    """Get the S3 bucket sync pipeline"""
+    return import_string(
+        f"content_sync.pipelines.{settings.CONTENT_SYNC_PIPELINE_BACKEND}.S3BucketSyncPipeline"
+    )(api=api)
+
+
+@is_sync_enabled
+def sync_content(sync_state: ContentSyncState):
+    """Sync a piece of content based on its sync state"""
+    backend = get_sync_backend(sync_state.content.website)
+    backend.sync_content_to_backend(sync_state)
+
+
+@is_sync_enabled
+def create_website_backend(website: Website):
+    """Create the backend for a website"""
+    tasks.create_website_backend.delay(website.name)
+
+
+@is_sync_enabled
+def update_website_backend(website: Website):
+    """Update the backend content for a website"""
+    tasks.sync_website_content.delay(website.name)
+
+
+@is_sync_enabled
+def trigger_publish(website_name: str, version: str):
+    """Publish the website on the backend"""
+    if version == VERSION_DRAFT:
+        tasks.publish_website_backend_draft.delay(website_name)
+    else:
+        tasks.publish_website_backend_live.delay(website_name)
+
+
+@is_sync_enabled
+def trigger_unpublished_removal(website: Website):
+    """Remove unpublished sites on the backend"""
+    tasks.trigger_unpublished_removal.delay(website.name)
+
+
+def sync_github_website_starters(
+    url: str,
+    files: list[str],
+    commit: str | None = None,
+    tag: str | None = None,
+):
+    """Sync website starters from github"""
+    kwargs = {"commit": commit}
+    if tag is not None:
+        kwargs["tag"] = tag
+    tasks.sync_github_site_configs.delay(url, files, **kwargs)
+
+
+def publish_website(  # pylint: disable=too-many-arguments
+    name: str,
+    version: str,
+    pipeline_api: object | None = None,
+    *,
+    prepublish: bool | None = True,
+    trigger_pipeline: bool | None = True,
+):
+    """Publish a live or draft version of a website"""
+    update_kwargs = {}
+    try:
+        website = Website.objects.get(name=name)
+        if prepublish:
+            for action in settings.PREPUBLISH_ACTIONS:
+                import_string(action)(website, version=version)
+        backend = get_sync_backend(website)
+        backend.sync_all_content_to_backend()
+        if version == VERSION_DRAFT:
+            update_kwargs["draft_publish_date"] = now_in_utc()
+            backend.merge_backend_draft()
+        else:
+            update_kwargs["publish_date"] = now_in_utc()
+            backend.merge_backend_live()
+
+        if trigger_pipeline and settings.CONTENT_SYNC_PIPELINE_BACKEND:
+            pipeline = get_site_pipeline(website, api=pipeline_api)
+            # Always upsert pipeline in case the site url path changed,
+            # unless it's been published to production (url path permanent).
+            if not website.publish_date:
+                pipeline.upsert_pipeline()
+            pipeline.unpause_pipeline(version)
+            pipeline.check_online_site_job_resources(version)
+            build_id = pipeline.trigger_pipeline_build(version)
+            update_kwargs[f"latest_build_id_{version}"] = build_id
+
+            is_default_theme_site = (
+                website.starter
+                and website.starter.slug == settings.OCW_DEFAULT_COURSE_THEME
+            )
+            if is_default_theme_site and settings.OCW_EXTRA_COURSE_THEMES:
+                for theme_slug in settings.OCW_EXTRA_COURSE_THEMES:
+                    theme_pipeline = get_site_pipeline(
+                        website,
+                        api=pipeline.api,
+                        theme_slug=theme_slug,
+                        prefix=theme_slug,
+                        noindex=True,
+                    )
+                    theme_pipeline_name = f"{version}-{theme_slug}"
+                    if not website.publish_date:
+                        theme_pipeline.upsert_pipeline()
+                    theme_pipeline.unpause_pipeline(theme_pipeline_name)
+                    theme_pipeline.check_online_site_job_resources(theme_pipeline_name)
+                    theme_pipeline.trigger_pipeline_build(theme_pipeline_name)
+
+        # Need to update additional fields
+        update_kwargs = {
+            **update_kwargs,
+            f"{version}_publish_status": PUBLISH_STATUS_NOT_STARTED,
+            f"{version}_publish_status_updated_on": now_in_utc(),
+            f"has_unpublished_{version}": False,
+        }
+    except:  # pylint:disable=bare-except
+        update_kwargs = {
+            **update_kwargs,
+            f"{version}_publish_status": PUBLISH_STATUS_ERRORED,
+            f"{version}_publish_status_updated_on": now_in_utc(),
+            f"has_unpublished_{version}": True,
+        }
+        raise
+    finally:
+        Website.objects.filter(name=name).update(**update_kwargs)
+        tasks.update_mass_build_pipelines_on_publish.delay(
+            version=version, website_pk=website.pk
+        )
+
+
+def throttle_git_backend_calls(backend: object, min_delay: int | None = None):
+    """If the current git api limit is too low, sleep until it is reset"""
+    check_setting = getattr(backend, "rate_limit_check_setting", None)
+    cutoff_setting = getattr(backend, "rate_limit_cutoff_setting", None)
+    min_sleep_setting = getattr(backend, "rate_limit_min_sleep_setting", None)
+    backend_name = getattr(backend, "rate_limit_name", "git")
+
+    if not all([check_setting, cutoff_setting, min_sleep_setting]) or not hasattr(
+        backend, "get_rate_limit_status"
+    ):
+        return
+    if not getattr(settings, check_setting):
+        return
+
+    min_delay = min_delay or getattr(settings, min_sleep_setting)
+    rate_limit_status = backend.get_rate_limit_status()
+    if rate_limit_status is None:
+        sleep(min_delay)
+        return
+
+    requests_remaining, limit, reset_time = rate_limit_status
+    if isinstance(reset_time, (int, float)):
+        reset_time = datetime.fromtimestamp(reset_time, tz=pytz.utc)
+    elif not isinstance(reset_time, datetime):
+        reset_time = now_in_utc() + timedelta(seconds=min_delay + 2)
+    log.debug(
+        "Remaining %s calls : %d/%d, reset: %s",
+        backend_name,
+        requests_remaining,
+        limit,
+        reset_time.isoformat(),
+    )
+    if requests_remaining <= getattr(settings, cutoff_setting):
+        # total_seconds(), not .seconds: the latter is the normalised remainder
+        # of a timedelta, so a reset time in the past yields up to 86399
+        # instead of 0. Clamped for the same reason.
+        sleep(max(0.0, (reset_time - now_in_utc()).total_seconds()))
+    else:
+        sleep(min_delay)

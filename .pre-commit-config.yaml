@@ -1,0 +1,128 @@
+---
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: trailing-whitespace
+    exclude: static/js/lib/ckeditor/plugins/MarkdownListSyntax.test.ts|.yarn/
+  - id: end-of-file-fixer
+    exclude: ".hbs$|.yarn/"
+  - id: check-yaml
+    exclude: content_sync/pipelines/definitions/
+    args:
+    - --allow-multiple-documents
+  - id: check-added-large-files
+  - id: check-merge-conflict
+  - id: check-toml
+  - id: debug-statements
+- repo: https://github.com/scop/pre-commit-shfmt
+  rev: v3.13.1-1
+  hooks:
+  - id: shfmt-docker
+- repo: https://github.com/jumanjihouse/pre-commit-hook-yamlfmt
+  rev: 0.2.3
+  hooks:
+  - id: yamlfmt
+    args:
+    - --mapping
+    - "2"
+    - --sequence
+    - "2"
+    - --offset
+    - "0"
+    - --width
+    - "80"
+    - --preserve-quotes
+    exclude: content_sync/pipelines/definitions/
+- repo: https://github.com/adrienverge/yamllint.git
+  rev: v1.38.0
+  hooks:
+  - id: yamllint
+    args: [--format, parsable, -d, relaxed]
+    exclude: content_sync/pipelines/definitions/
+- repo: https://github.com/Yelp/detect-secrets
+  rev: v1.5.0
+  hooks:
+  - id: detect-secrets
+    args:
+    - --baseline
+    - .secrets.baseline
+    - --exclude-files
+    - .yarn/
+    - --exclude-files
+    - cassettes/
+    - --exclude-files
+    - test_json/
+    - --exclude-files
+    - ".*_test.py"
+    - --exclude-files
+    - "test_.*.py"
+    - --exclude-files
+    - poetry.lock
+    - --exclude-files
+    - yarn.lock
+    - --exclude-files
+    - ".*/generated/"
+    - --exclude-files
+    - "config/keycloak/realms/ocw-studio-realm.json"
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: "v0.16.9"
+  hooks:
+  - id: ruff-format
+    exclude: ".*/migrations/.*"
+  - id: ruff
+    args: [--extend-ignore=D1, --fix]
+    exclude: ".*/migrations/.*"
+- repo: local
+  hooks:
+  - id: prettier
+    name: Prettier
+    language: node
+    entry: yarn
+    args: [run, prettier, --write, --ignore-unknown]
+    types_or: [javascript, jsx, ts, tsx, json, scss, sass, css, markdown, html]
+    exclude: ".yarn/"
+  - id: eslint
+    name: eslint
+    description: "Lint JS/TS files and apply automatic fixes"
+    entry: yarn
+    language: node
+    types_or: [javascript, jsx, ts, tsx]
+    args: [run, eslint, --fix, --quiet]
+    exclude: "(node_modules/|.yarn/)"
+    require_serial: false
+  - id: stylelint
+    name: stylelint
+    description: "Lint SCSS files"
+    entry: yarn
+    language: node
+    types_or: [scss, css, sass]
+    args: [run, stylelint, --allow-empty-input, --fix]
+    exclude: "(node_modules/|static/css/vendor/)"
+    require_serial: false
+- repo: https://github.com/shellcheck-py/shellcheck-py
+  rev: v0.11.0.1
+  hooks:
+  - id: shellcheck
+    args: ["--severity=warning"]
+- repo: https://github.com/zizmorcore/zizmor-pre-commit
+  rev: v1.30.1
+  hooks:
+  - id: zizmor
+    args: [--no-progress, --min-severity=medium, --min-confidence=medium]
+- repo: local
+  hooks:
+  - id: drf-serializer-orm-check
+    name: DRF Serializer ORM Check
+    description: "Detects Django ORM queries inside DRF serializer methods (N+1 risk)"
+    entry: drf-lint
+    args: [--baseline, drf_lint_baseline.json]
+    language: python
+    files: 'serializers\.py$'
+    additional_dependencies:
+    # Pinned, and kept in step with pyproject.toml. Unpinned, pre-commit.ci
+    # silently follows the newest release, so the hook can start reporting
+    # checks the project's own version does not.
+    - mitol-drf-lint==2026.8.28

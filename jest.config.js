@@ -1,0 +1,43 @@
+module.exports = {
+  setupFiles: ["<rootDir>/jest.setup.js"],
+  setupFilesAfterEnv: ["<rootDir>static/js/test_setup.ts"],
+  cacheDirectory: ".jest-cache",
+  transform: { "^.+\\.(t|j)sx?$": ["@swc/jest"] },
+  moduleNameMapper: {
+    "\\.svg$": "<rootDir>/static/js/mocks/svgMock.js",
+    "\\.(jpg|jpeg|png|gif|eot|otf|webp|ttf|woff|woff2|mp4|webm|wav|mp3|m4a|aac|oga)$":
+      "<rootDir>/static/js/mocks/fileMock.js",
+    "\\.(css|less)$": "<rootDir>/static/js/mocks/styleMock.js",
+  },
+  // this here is a little bit of hackery! we need to mark a few modules in node_modules
+  // not to *ignore* them but actually to include them in the transform. Jest doesn't have
+  // a transformIncludePattern option, so this is how they recommend you explicitly include
+  // code in node_modules. We need to do this because CKEditor code is distributed as ES6
+  // modules with some webpack-specific syntax in it. This will ensure it gets transpiled
+  // with Babel (this is cached between test runs so it doesn't have too much performance
+  // overhead. See here for some details:
+  // https://jestjs.io/docs/en/tutorial-react-native#transformignorepatterns-customization
+  transformIgnorePatterns: [
+    "/node_modules/(?!(" +
+      "@ckeditor/*" +
+      "|@isaul32/ckeditor5-math/*" +
+      "|ckeditor5/*" +
+      "|lodash-es" +
+      "|sinon" +
+      // @ckeditor/ckeditor5-markdown-gfm resolves turndown to its ESM browser build
+      "|turndown" +
+      // pulled in by @ckeditor/ckeditor5-ui's color picker; ships untranspiled ESM
+      "|vanilla-colorful" +
+      ")/)",
+  ],
+  testPathIgnorePatterns: [
+    "<rootDir>/staticfiles/",
+    "<rootDir>/node_modules/",
+    "<rootDir>/.claude/",
+  ],
+  testEnvironment: "jsdom",
+  watchPlugins: [
+    "jest-watch-typeahead/filename",
+    "jest-watch-typeahead/testname",
+  ],
+}

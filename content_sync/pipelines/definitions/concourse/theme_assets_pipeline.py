@@ -1,0 +1,230 @@
+from typing import ClassVar
+
+from django.conf import settings
+from ol_concourse.lib.models.pipeline import (
+    Command,
+    GetStep,
+    Identifier,
+    Input,
+    Job,
+    Output,
+    Pipeline,
+    TaskConfig,
+    TaskStep,
+)
+from ol_concourse.lib.resource_types import (
+    fastly_resource_type,
+    slack_notification_resource,
+)
+
+from content_sync.constants import VERSION_DRAFT, VERSION_LIVE
+from content_sync.pipelines.definitions.concourse.common.identifiers import (
+    OCW_HUGO_THEMES_GIT_IDENTIFIER,
+)
+from content_sync.pipelines.definitions.concourse.common.image_resources import (
+    AWS_CLI_REGISTRY_IMAGE,
+    OCW_COURSE_PUBLISHER_REGISTRY_IMAGE,
+)
+from content_sync.pipelines.definitions.concourse.common.resources import (
+    GitResource,
+    SlackAlertResource,
+    fastly_resources,
+)
+from content_sync.pipelines.definitions.concourse.common.steps import (
+    SlackAlertStep,
+    clear_cdn_cache_steps,
+)
+from content_sync.utils import get_cli_endpoint_url, get_hugo_tag_regex
+from main.utils import is_dev
+from websites.constants import OCW_HUGO_THEMES_GIT
+
+
+class ThemeAssetsPipelineDefinition(Pipeline):
+    """
+    A Pipeline that does the following:
+
+     - Fetch the ocw-hugo-themes git repository
+     - Run the Webpack build in ocw-hugo-themes
+     - Upload the Webpack manifest (webpack.json) to artifacts_bucket
+     - Upload the output to preview_bucket and publish_bucket
+
+    Args:
+        artifacts_bucket(str): An S3 bucket with versioning enabled for storing the Webpack manifest
+        preview_bucket(str): The S3 bucket where preview sites are to be stored
+        publish_bucket(str): The S3 bucket where published sites are to be stored
+        test_bucket(str): The S3 bucket where test sites are to be stored
+        ocw_hugo_themes_branch(str): The branch of ocw-hugo-themes to clone
+        instance_vars:(str): Instance vars for the pipeline in query string format
+    """  # noqa: E501
+
+    _build_theme_assets_job_identifier: ClassVar[str] = Identifier(
+        "build-theme-assets-job"
+    ).root
+    _build_ocw_hugo_themes_identifier: ClassVar[str] = Identifier(
+        "build-ocw-hugo-themes-task"
+    ).root
+    _upload_theme_assets_task_identifier: ClassVar[str] = Identifier(
+        "upload-theme-assets-task"
+    ).root
+    _clear_draft_cdn_cache_task_identifier: ClassVar[str] = Identifier(
+        "clear-draft-cdn-cache-task"
+    ).root
+    _clear_live_cdn_cache_identifier: ClassVar[str] = Identifier(
+        "clear-live-cdn-cache-task"
+    ).root
+    _slack_resource: ClassVar[SlackAlertResource] = SlackAlertResource()
+
+    def __init__(
+        self,
+        artifacts_bucket: str,
+        preview_bucket: str,
+        publish_bucket: str,
+        test_bucket: str,
+        ocw_hugo_themes_branch: str,
+        **kwargs,
+    ):
+        base = super()
+        cli_endpoint_url = get_cli_endpoint_url()
+        ocw_hugo_themes_resource = GitResource(
+            name=OCW_HUGO_THEMES_GIT_IDENTIFIER,
+            uri=OCW_HUGO_THEMES_GIT,
+            branch=ocw_hugo_themes_branch,
+            tag_regex=get_hugo_tag_regex(ocw_hugo_themes_branch),
+        )
+        resource_types = []
+        resources = [ocw_hugo_themes_resource]
+        themes_env = {
+            "SEARCH_API_URL": settings.SEARCH_API_URL,
+            "COURSE_SEARCH_API_URL": settings.COURSE_SEARCH_API_URL,
+            "CONTENT_FILE_SEARCH_API_URL": settings.CONTENT_FILE_SEARCH_API_URL,
+            "MIT_LEARN_BASE_URL": settings.MIT_LEARN_BASE_URL,
+            "MIT_LEARN_API_BASE_URL": settings.MIT_LEARN_API_BASE_URL,
+            "LEARN_AI_SYLLABUS_ENDPOINT": settings.LEARN_AI_SYLLABUS_ENDPOINT,
+            "SENTRY_DSN": settings.OCW_HUGO_THEMES_SENTRY_DSN,
+            "SENTRY_ENV": settings.ENVIRONMENT,
+            "POSTHOG_ENABLED": str(settings.PUBLISH_POSTHOG_ENABLED).lower(),
+            "POSTHOG_API_HOST": settings.PUBLISH_POSTHOG_API_HOST,
+            "POSTHOG_UI_HOST": settings.PUBLISH_POSTHOG_UI_HOST,
+            "POSTHOG_ENV": settings.ENVIRONMENT,
+            "CSRF_COOKIE_NAME": settings.HUGO_CSRF_COOKIE_NAME,
+        }
+        if (
+            settings.PUBLISH_POSTHOG_ENABLED
+            and settings.PUBLISH_POSTHOG_PROJECT_API_KEY
+        ):
+            themes_env["POSTHOG_ENABLED"] = str(
+                settings.PUBLISH_POSTHOG_ENABLED
+            ).lower()
+            themes_env["POSTHOG_PROJECT_API_KEY"] = (
+                settings.PUBLISH_POSTHOG_PROJECT_API_KEY
+            )
+        tasks = [
+            GetStep(
+                get=OCW_HUGO_THEMES_GIT_IDENTIFIER,
+                trigger=(not is_dev()),
+            ),
+            TaskStep(
+                task=self._build_ocw_hugo_themes_identifier,
+                config=TaskConfig(
+                    platform="linux",
+                    image_resource=OCW_COURSE_PUBLISHER_REGISTRY_IMAGE,
+                    inputs=[Input(name=OCW_HUGO_THEMES_GIT_IDENTIFIER)],
+                    outputs=[Output(name=OCW_HUGO_THEMES_GIT_IDENTIFIER)],
+                    params=themes_env,
+                    run=Command(
+                        path="sh",
+                        args=[
+                            "-exc",
+                            f"""
+                            cd {OCW_HUGO_THEMES_GIT_IDENTIFIER}
+                            export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+                            corepack enable
+                            yarn install --immutable
+                            npm run build:webpack
+                            npm run build:githash
+                            """,
+                        ],
+                    ),
+                ),
+            ),
+            TaskStep(
+                task=self._upload_theme_assets_task_identifier,
+                timeout="20m",
+                attempts=3,
+                config=TaskConfig(
+                    platform="linux",
+                    image_resource=AWS_CLI_REGISTRY_IMAGE,
+                    inputs=[Input(name=OCW_HUGO_THEMES_GIT_IDENTIFIER)],
+                    params=(
+                        {}
+                        if not is_dev()
+                        else {
+                            "AWS_ACCESS_KEY_ID": settings.AWS_ACCESS_KEY_ID or "",
+                            "AWS_SECRET_ACCESS_KEY": settings.AWS_SECRET_ACCESS_KEY
+                            or "",
+                        }
+                    ),
+                    run=Command(
+                        path="sh",
+                        args=[
+                            "-exc",
+                            f"""
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/dist s3://{preview_bucket} --recursive --metadata site-id=ocw-hugo-themes
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/dist s3://{publish_bucket} --recursive --metadata site-id=ocw-hugo-themes
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/dist s3://{test_bucket} --recursive --metadata site-id=ocw-hugo-themes
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/static s3://{preview_bucket} --recursive --metadata site-id=ocw-hugo-themes
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/static s3://{publish_bucket} --recursive --metadata site-id=ocw-hugo-themes
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/static s3://{test_bucket} --recursive --metadata site-id=ocw-hugo-themes
+                            aws s3{cli_endpoint_url} cp {OCW_HUGO_THEMES_GIT_IDENTIFIER}/base-theme/data/webpack.json s3://{artifacts_bucket}/ocw-hugo-themes/{ocw_hugo_themes_branch}/webpack.json --metadata site-id=ocw-hugo-themes
+                            """,  # noqa: E501
+                        ],
+                    ),
+                ),
+            ),
+        ]
+        job = Job(name=self._build_theme_assets_job_identifier, serial=True)
+        if not is_dev():
+            resource_types.append(slack_notification_resource())
+            resources.append(self._slack_resource)
+            purge_resources = [
+                *fastly_resources(VERSION_DRAFT),
+                *fastly_resources(VERSION_LIVE),
+            ]
+            if purge_resources:
+                resource_types.append(fastly_resource_type())
+                resources.extend(purge_resources)
+            tasks.extend(
+                [
+                    *clear_cdn_cache_steps(
+                        name=self._clear_draft_cdn_cache_task_identifier,
+                        purpose=VERSION_DRAFT,
+                        site_name="ocw-hugo-themes",
+                    ),
+                    *clear_cdn_cache_steps(
+                        name=self._clear_live_cdn_cache_identifier,
+                        purpose=VERSION_LIVE,
+                        site_name="ocw-hugo-themes",
+                    ),
+                ]
+            )
+            job.on_failure = SlackAlertStep(
+                alert_type="failed",
+                text=f"""
+                Failed to build theme assets.
+
+                Append `?vars.branch={ocw_hugo_themes_branch}` to the url below for more details.
+                """,  # noqa: E501
+            )
+            job.on_abort = SlackAlertStep(
+                alert_type="aborted",
+                text=f"""
+                User aborted while building theme assets.
+
+                Append `?vars.branch={ocw_hugo_themes_branch}` to the url below for more details.
+                """,  # noqa: E501
+            )
+
+        job.plan = tasks
+        base.__init__(
+            resource_types=resource_types, resources=resources, jobs=[job], **kwargs
+        )

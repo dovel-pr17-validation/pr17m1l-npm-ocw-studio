@@ -1,0 +1,1611 @@
+"""videos.tasks tests"""
+
+import string
+from datetime import datetime
+from random import choice
+from urllib.parse import urljoin
+
+import pytest
+import pytz
+import requests
+from celery.exceptions import Retry
+from django.conf import settings
+from googleapiclient.errors import HttpError, ResumableUploadError
+from moto import mock_aws
+
+from gdrive_sync.api import create_gdrive_resource_content
+from gdrive_sync.constants import (
+    DRIVE_FILE_CREATED_TIME,
+    DRIVE_FILE_DOWNLOAD_LINK,
+    DRIVE_FILE_ID,
+    DRIVE_FILE_MD5_CHECKSUM,
+    DRIVE_FILE_MODIFIED_TIME,
+    DRIVE_FILE_SIZE,
+    DriveFileStatus,
+)
+from gdrive_sync.factories import DriveFileFactory
+from gdrive_sync.models import DriveFile
+from gdrive_sync.utils import get_resource_name
+from main.s3_utils import get_boto3_client
+from main.utils import get_base_filename
+from users.factories import UserFactory
+from videos.conftest import MOCK_BUCKET_NAME, MockHttpErrorResponse, setup_s3
+from videos.constants import (
+    DESTINATION_YOUTUBE,
+    YT_THUMBNAIL_IMG,
+    VideoFileStatus,
+    VideoStatus,
+    YouTubeStatus,
+)
+from videos.factories import VideoFactory, VideoFileFactory
+from videos.models import VideoFile
+from videos.tasks import (
+    attempt_to_update_missing_transcripts,
+    copy_gdrive_file,
+    copy_video_resource,
+    create_drivefile,
+    delete_s3_objects,
+    mail_transcripts_complete_notification,
+    start_transcript_job,
+    update_transcripts_for_updated_videos,
+    update_transcripts_for_video,
+    update_transcripts_for_website,
+    update_youtube_statuses,
+    update_youtube_tags_batch,
+    upload_youtube_videos,
+)
+from videos.youtube import API_QUOTA_ERROR_MSG
+from websites.constants import RESOURCE_TYPE_VIDEO
+from websites.factories import WebsiteContentFactory, WebsiteFactory
+from websites.messages import VideoTranscriptingCompleteMessage
+from websites.models import WebsiteContent
+from websites.utils import get_dict_field, set_dict_field
+
+# pylint:disable=unused-argument,redefined-outer-name
+pytestmark = pytest.mark.django_db
+
+
+def create_video(youtube_id, title):
+    """
+    Creates video file with the given youtube_id and title.
+    """  # noqa: D401
+    video_file = VideoFileFactory.create(
+        status=VideoStatus.CREATED,
+        destination=DESTINATION_YOUTUBE,
+        destination_id=youtube_id,
+    )
+
+    video = video_file.video
+    video.source_key = "the/file"
+    video.save()
+
+    return video
+
+
+def create_content(website, youtube_id, title):
+    """
+    Creates website content with the given website, youtube_id, and title.
+    """  # noqa: D401
+    return WebsiteContentFactory.create(
+        website=website,
+        metadata={"video_metadata": {"youtube_id": youtube_id}},
+        title=title,
+    )
+
+
+def set_nested_dicts(obj, field_path, value):
+    """Set the value of a potentially nested dict path"""
+    fields = field_path.split(".")
+    current_obj = obj
+    for field in fields[:-1]:
+        current_obj[field] = {}
+        current_obj = current_obj[field]
+
+    current_obj[fields[-1]] = value
+
+
+def updated_transctipts_reponse():
+    """Mock api response for s3 updated transcripts api call"""
+    return {
+        "code": 200,
+        "data": [
+            {
+                "id": 6737396,
+                "name": "12. Carbohydrates/Introduction to Membranes\n",
+                "duration": 10.0,
+                "word_count": 16,
+                "language_id": 1,
+                "language_ids": [1],
+                "source": "https://www.youtube.com/watch?v=test",
+                "batch_id": 200797,
+                "reference_id": "reference_id",
+                "labels": ["updated"],
+                "created_at": "2021-08-19T10:43:26.000-04:00",
+                "updated_at": "2021-09-01T21:14:19.000-04:00",
+            }
+        ],
+        "pagination": {"page": 1, "per_page": 25, "total_entries": 1},
+    }
+
+
+@pytest.fixture
+def youtube_video_files_new():
+    """Return 3 Youtube video files"""
+    return VideoFileFactory.create_batch(
+        3,
+        status=VideoStatus.CREATED,
+        destination=DESTINATION_YOUTUBE,
+        destination_id=None,
+    )
+
+
+@pytest.fixture
+def youtube_video_files_processing():
+    """Return 3 Youtube video files"""
+    return VideoFileFactory.create_batch(
+        3,
+        status=VideoFileStatus.UPLOADED,
+        destination=DESTINATION_YOUTUBE,
+        destination_status=YouTubeStatus.PROCESSING,
+    )
+
+
+@pytest.mark.parametrize("is_enabled", [True, False])
+@pytest.mark.parametrize("max_uploads", [2, 4])
+def test_upload_youtube_videos(
+    mocker, youtube_video_files_new, max_uploads, is_enabled, mocked_celery
+):
+    """
+    Test that the upload_youtube_videos task calls YouTubeApi.upload_video
+    & creates a YoutubeVideo object for each public video, up to the max daily limit
+    """
+    if not is_enabled:
+        settings.YT_CLIENT_ID = None
+    settings.YT_UPLOAD_LIMIT = max_uploads
+    mock_youtube = mocker.patch("videos.tasks.YouTubeApi")
+    mock_uploader = mock_youtube.return_value.upload_video
+    # upload_video now returns a tuple (response, course_tag)
+    mock_uploader.return_value = (
+        {
+            "id": "".join([choice(string.ascii_lowercase) for n in range(8)]),  # noqa: S311
+            "status": {"uploadStatus": "uploaded"},
+        },
+        None,  # course_tag
+    )
+
+    upload_youtube_videos.delay()
+    assert mock_uploader.call_count == (min(3, max_uploads) if is_enabled else 0)
+    assert mock_youtube.call_count == (1 if is_enabled else 0)
+    if is_enabled:
+        for video_file in VideoFile.objects.order_by("-created_on")[
+            : settings.YT_UPLOAD_LIMIT
+        ]:
+            assert video_file.destination_id is not None
+            assert video_file.destination_status == YouTubeStatus.UPLOADED
+            assert video_file.status == VideoFileStatus.UPLOADED
+
+
+def test_upload_youtube_videos_error(mocker, youtube_video_files_new):
+    """
+    Test that the VideoFile status is set properly if an error occurs during upload, and all videos are processed
+    """
+    mock_uploader = mocker.patch(
+        "videos.tasks.YouTubeApi.upload_video", side_effect=OSError
+    )
+    upload_youtube_videos.delay()
+    assert mock_uploader.call_count == 3
+    for video_file in youtube_video_files_new:
+        video_file.refresh_from_db()
+        assert video_file.status == VideoFileStatus.FAILED
+
+
+def test_upload_youtube_videos_saves_tags_to_metadata(mocker, mocked_celery):
+    """
+    Test that tags (including course tag) are saved back to WebsiteContent metadata after upload
+    """
+    # Create a website with course configuration
+    website = WebsiteFactory.create(
+        name="test-course",
+        url_path="courses/test-course-fall-2020",
+    )
+
+    # Create a video associated with the website
+    video = VideoFactory.create(website=website)
+
+    # Create WebsiteContent with video metadata (this is the resource linked via DriveFile)
+    video_content = WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "video_metadata": {
+                "video_tags": "python, django",
+            }
+        },
+    )
+
+    # Create DriveFile linking the video to the WebsiteContent resource
+    DriveFileFactory.create(
+        video=video,
+        resource=video_content,
+    )
+
+    # Create VideoFile for upload
+    video_file = VideoFileFactory.create(
+        video=video,
+        status=VideoStatus.CREATED,
+        destination=DESTINATION_YOUTUBE,
+        destination_id=None,
+    )
+
+    # Mock the YouTube upload to return a video ID
+    mock_youtube_id = "test_youtube_id_123"
+    mock_youtube = mocker.patch("videos.tasks.YouTubeApi")
+    mock_uploader = mock_youtube.return_value.upload_video
+    # upload_video now returns a tuple (response, merged_tags)
+    mock_uploader.return_value = (
+        {
+            "id": mock_youtube_id,
+            "status": {"uploadStatus": "uploaded"},
+        },
+        "python, django, test-course-fall-2020",  # merged tags
+    )
+
+    # Run the upload task
+    upload_youtube_videos.delay()
+
+    # Refresh from database
+    video_file.refresh_from_db()
+    video_content.refresh_from_db()
+
+    # Verify video was uploaded successfully
+    assert video_file.destination_id == mock_youtube_id
+    assert video_file.status == VideoFileStatus.UPLOADED
+
+    # Verify tags were saved to metadata with course tag appended
+    saved_tags = video_content.metadata["video_metadata"]["video_tags"]
+    assert "python" in saved_tags
+    assert "django" in saved_tags
+    assert "test-course-fall-2020" in saved_tags
+
+    assert saved_tags == "python, django, test-course-fall-2020"
+
+
+def test_upload_youtube_videos_passes_existing_tags_as_kwarg(mocker, mocked_celery):
+    """
+    Test that existing_tags is passed as a keyword argument to upload_video.
+    """
+    tags = "machine learning, ai"
+
+    # Create a website with course configuration
+    website = WebsiteFactory.create(
+        name="test-course",
+        url_path="courses/test-course-fall-2020",
+    )
+
+    # Create a video associated with the website
+    video = VideoFactory.create(website=website)
+
+    # Create WebsiteContent with video metadata including tags
+    video_content = WebsiteContentFactory.create(website=website)
+    set_dict_field(video_content.metadata, settings.YT_FIELD_TAGS, tags)
+    video_content.save()
+
+    # Create DriveFile linking the video to the WebsiteContent resource
+    DriveFileFactory.create(
+        video=video,
+        resource=video_content,
+    )
+
+    # Create VideoFile for upload
+    video_file = VideoFileFactory.create(
+        video=video,
+        status=VideoStatus.CREATED,
+        destination=DESTINATION_YOUTUBE,
+        destination_id=None,
+    )
+
+    # Mock the YouTube upload
+    mock_youtube_id = "test_youtube_id_kwarg"
+    mock_youtube = mocker.patch("videos.tasks.YouTubeApi")
+    mock_uploader = mock_youtube.return_value.upload_video
+    mock_uploader.return_value = (
+        {
+            "id": mock_youtube_id,
+            "status": {"uploadStatus": "uploaded"},
+        },
+        "machine learning, ai, test-course-fall-2020",
+    )
+
+    # Run the upload task
+    upload_youtube_videos.delay()
+
+    # Verify upload_video was called with existing_tags as keyword argument
+    mock_uploader.assert_called_once()
+    call_args = mock_uploader.call_args
+
+    # Check positional args - should only be the video_file
+    assert len(call_args.args) == 1
+    assert call_args.args[0] == video_file
+
+    # Check that existing_tags was passed as keyword argument (not positional)
+    assert "existing_tags" in call_args.kwargs
+    assert call_args.kwargs["existing_tags"] == tags
+
+
+def test_upload_youtube_videos_no_videos(mocker):
+    """YouTube API shoould not be instantiated if there are no videos to upload"""
+    mock_youtube = mocker.patch("videos.tasks.YouTubeApi")
+
+    upload_youtube_videos.delay()
+    mock_youtube.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("msg", "status"),
+    [
+        [API_QUOTA_ERROR_MSG, VideoFileStatus.CREATED],  # noqa: PT007
+        ["other error", VideoFileStatus.FAILED],  # noqa: PT007
+    ],
+)
+def test_upload_youtube_quota_exceeded(mocker, youtube_video_files_new, msg, status):
+    """
+    Test that the YoutubeVideo object is deleted if an error occurs during upload,
+    and the loop is halted if the quota is exceeded.
+    """
+    mock_uploader = mocker.patch(
+        "videos.tasks.YouTubeApi.upload_video",
+        side_effect=ResumableUploadError(
+            MockHttpErrorResponse(403), str.encode(msg, "utf-8")
+        ),
+    )
+    upload_youtube_videos.delay()
+    assert mock_uploader.call_count == (1 if msg == API_QUOTA_ERROR_MSG else 3)
+    for video_file in youtube_video_files_new:
+        video_file.refresh_from_db()
+        assert video_file.status == status
+        assert video_file.destination_status is None
+        assert video_file.destination_id is None
+
+
+@pytest.mark.parametrize("wrong_caption_type", [True, False])
+@pytest.mark.parametrize("caption_exists", [True, False])
+@pytest.mark.parametrize("transcript_exists", [True, False])
+def test_start_transcript_job(
+    mocker, settings, caption_exists, transcript_exists, wrong_caption_type
+):
+    """Test start_transcript_job"""
+    youtube_id = "test"
+    threeplay_file_id = 1
+    settings.YT_FIELD_ID = "video_metadata.youtube_id"
+    title = "title"
+
+    video = create_video(youtube_id, title)
+    video_content = create_content(video.website, youtube_id, title)
+
+    base_filename = get_base_filename(video_content.filename)
+
+    base_path = f"/some/path/to/{base_filename}"
+
+    if wrong_caption_type:
+        WebsiteContentFactory.create(
+            website=video.website,
+            filename=f"{base_filename}_captions_srt",
+            file=f"{base_path}_captions.srt",
+        )
+
+    if caption_exists:
+        WebsiteContentFactory.create(
+            website=video.website,
+            filename=f"{base_filename}_captions_vtt",
+            file=f"{base_path}_captions.vtt",
+        )
+
+    if transcript_exists:
+        WebsiteContentFactory.create(
+            website=video.website,
+            filename=f"{base_filename}_transcript_pdf",
+            file=f"{base_path}_transcript.pdf",
+        )
+
+    mock_threeplay_upload_video_request = mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_upload_video_request",
+        return_value={"data": {"id": threeplay_file_id}},
+    )
+
+    mock_order_transcript_request_request = mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_order_transcript_request"
+    )
+
+    start_transcript_job.apply([video.id])
+
+    video_content.refresh_from_db()
+    if caption_exists:
+        captions_relation = get_dict_field(
+            video_content.metadata, settings.YT_FIELD_CAPTIONS_RESOURCES
+        )
+        assert isinstance(captions_relation, dict)
+        assert len(captions_relation["content"]) == 1
+        assert captions_relation["website"] == video.website.name
+    else:
+        assert (
+            get_dict_field(video_content.metadata, settings.YT_FIELD_CAPTIONS_RESOURCES)
+            is None
+        )
+    if transcript_exists:
+        transcript_relation = get_dict_field(
+            video_content.metadata, settings.YT_FIELD_TRANSCRIPT_RESOURCES
+        )
+        assert isinstance(transcript_relation, dict)
+        assert len(transcript_relation["content"]) == 1
+        assert transcript_relation["website"] == video.website.name
+    else:
+        assert (
+            get_dict_field(
+                video_content.metadata, settings.YT_FIELD_TRANSCRIPT_RESOURCES
+            )
+            is None
+        )
+
+    if transcript_exists or caption_exists:
+        mock_threeplay_upload_video_request.assert_not_called()
+        mock_order_transcript_request_request.assert_not_called()
+        return
+
+    mock_threeplay_upload_video_request.assert_called_once_with(
+        video.website.short_id,
+        youtube_id,
+        title,
+        timeout=settings.THREEPLAY_BASE_TIMEOUT,
+    )
+    if video.status != VideoStatus.SUBMITTED_FOR_TRANSCRIPTION:
+        mock_order_transcript_request_request.assert_called_once_with(
+            video.id, threeplay_file_id, timeout=settings.THREEPLAY_BASE_TIMEOUT
+        )
+    else:
+        mock_order_transcript_request_request.assert_not_called()
+
+
+# pylint:disable=unused-variable
+def test_threeplay_submission_called_once_per_video(mocker, settings):
+    """
+    Test that the threeplay_order_transcript_request function is called only once per video.
+    """
+    youtube_id = "test"
+    threeplay_file_id = 1
+    settings.YT_FIELD_ID = "video_metadata.youtube_id"
+    title = "title"
+
+    video = create_video(youtube_id, title)
+    create_content(video.website, youtube_id, title)
+
+    mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_upload_video_request",
+        return_value={"data": {"id": 1}},
+    )
+
+    mock_order_transcript_request_request = mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_order_transcript_request"
+    )
+
+    start_transcript_job.apply([video.id])
+    start_transcript_job.apply([video.id])
+
+    if video.status != VideoStatus.SUBMITTED_FOR_TRANSCRIPTION:
+        mock_order_transcript_request_request.assert_called_once_with(
+            video.id, threeplay_file_id, timeout=settings.THREEPLAY_BASE_TIMEOUT
+        )
+    else:
+        mock_order_transcript_request_request.assert_not_called()
+
+
+@pytest.mark.parametrize("is_enabled", [True, False])
+def test_update_youtube_statuses(  # pylint:disable=too-many-arguments  # noqa: PLR0913, PLR0917
+    settings,
+    mocker,
+    youtube_video_files_processing,
+    youtube_video_files_new,
+    is_enabled,
+    mocked_celery,
+):
+    """
+    Test that the correct number of YouTubeVideo objects have their statuses updated to the correct value.
+    """
+    if not is_enabled:
+        settings.YT_CLIENT_ID = None
+    mock_youtube = mocker.patch("videos.tasks.YouTubeApi")
+    mock_youtube.return_value.video_status.return_value = YouTubeStatus.PROCESSED
+    mock_mail_youtube_upload_success = mocker.patch(
+        "videos.tasks.mail_youtube_upload_success"
+    )
+    mocker.patch("gdrive_sync.api.get_resource_type", return_value=RESOURCE_TYPE_VIDEO)
+    for video_file in youtube_video_files_processing:
+        drive_file = DriveFileFactory.create(video=video_file.video)
+        create_gdrive_resource_content(drive_file)
+    mock_transcript_job = mocker.patch("videos.tasks.start_transcript_job.s")
+    if is_enabled:
+        with pytest.raises(mocked_celery.replace_exception_class):
+            update_youtube_statuses.delay()
+    else:
+        update_youtube_statuses.delay()
+    assert VideoFile.objects.filter(
+        destination_status=YouTubeStatus.PROCESSED, status=VideoFileStatus.COMPLETE
+    ).count() == (3 if is_enabled else 0)
+    if is_enabled:
+        mock_youtube.assert_called_once()
+
+        for video_file in youtube_video_files_processing:
+            mock_mail_youtube_upload_success.assert_any_call(video_file)
+            assert video_file.video.drivefile_set.first().resource.metadata == {
+                "resourcetype": "Video",
+                "file_type": video_file.video.drivefile_set.first().mime_type,
+                "file_size": video_file.video.drivefile_set.first().size,
+                "video_files": {
+                    "video_thumbnail_file": YT_THUMBNAIL_IMG.format(
+                        video_id=video_file.destination_id
+                    )
+                },
+                "video_metadata": {"youtube_id": video_file.destination_id},
+                "image": "",
+                "license": "default_license_specificed_in_config",
+            }
+            mock_transcript_job.assert_any_call(video_file.video.id)
+    else:
+        mock_youtube.assert_not_called()
+        mock_mail_youtube_upload_success.assert_not_called()
+
+
+def test_update_youtube_statuses_api_quota_exceeded(
+    mocker, youtube_video_files_processing
+):
+    """
+    Test that the update_youtube_statuses task stops without raising an error if the API quota is exceeded.
+    """
+    mock_video_status = mocker.patch(
+        "videos.tasks.YouTubeApi.video_status",
+        side_effect=HttpError(
+            MockHttpErrorResponse(403), str.encode(API_QUOTA_ERROR_MSG, "utf-8")
+        ),
+    )
+    update_youtube_statuses.delay()
+    mock_video_status.assert_called_once()
+
+
+def test_update_youtube_statuses_http_error(mocker, youtube_video_files_processing):
+    """
+    Test that an error is raised if any http error occurs other than exceeding daily API quota
+    """
+    mock_video_status = mocker.patch(
+        "videos.tasks.YouTubeApi.video_status",
+        side_effect=HttpError(MockHttpErrorResponse(403), b"other error"),
+    )
+    mock_mail_youtube_upload_failure = mocker.patch(
+        "videos.tasks.mail_youtube_upload_failure"
+    )
+    mock_log = mocker.patch("videos.tasks.log.exception")
+    update_youtube_statuses.delay()
+    for video_file in youtube_video_files_processing:
+        mock_video_status.assert_any_call(video_file.destination_id)
+        mock_log.assert_any_call(
+            "Error for youtube_id %s: %s", video_file.destination_id, "other error"
+        )
+        mock_mail_youtube_upload_failure.assert_any_call(video_file)
+
+
+def test_update_youtube_statuses_index_error(mocker, youtube_video_files_processing):
+    """
+    Test that an error is raised if a index error occurs
+    """
+    mock_log = mocker.patch("videos.tasks.log.exception")
+    mocker.patch(
+        "videos.tasks.YouTubeApi.video_status",
+        side_effect=IndexError(),
+    )
+    mock_mail_youtube_upload_failure = mocker.patch(
+        "videos.tasks.mail_youtube_upload_failure"
+    )
+    update_youtube_statuses.delay()
+    for video_file in youtube_video_files_processing:
+        mock_log.assert_any_call(
+            "Status of YouTube video not found: youtube_id %s",
+            video_file.destination_id,
+        )
+        mock_mail_youtube_upload_failure.assert_any_call(video_file)
+
+
+def test_update_youtube_statuses_no_videos(mocker):
+    """Youtube API should not be instantiated if there are no videos to process"""
+    mock_youtube = mocker.patch("videos.tasks.YouTubeApi")
+    update_youtube_statuses.delay()
+    mock_youtube.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "youtube_status",
+    [
+        getattr(YouTubeStatus, field)
+        for field in dir(YouTubeStatus)
+        if not field.startswith("__")
+    ],
+)
+@pytest.mark.parametrize(
+    "file_status",
+    [
+        getattr(VideoFileStatus, field)
+        for field in dir(VideoFileStatus)
+        if not field.startswith("__")
+    ],
+)
+def test_mail_youtube_upload_success_trigger(mocker, youtube_status, file_status):
+    """mail_youtube_upload_success should only be triggered once during the various status transitions."""
+    mock_mail_success = mocker.patch("videos.tasks.mail_youtube_upload_success")
+    mock_video_status = mocker.patch("videos.tasks.YouTubeApi.video_status")
+    mock_video_status.return_value = youtube_status
+    mocker.patch("videos.tasks.start_transcript_job.s")
+    mocker.patch.object(update_youtube_statuses, "replace")
+
+    video_file = VideoFileFactory.create(
+        id=1,
+        status=file_status,
+        destination_status=youtube_status,
+        destination=DESTINATION_YOUTUBE,
+    )
+    drive_file = DriveFileFactory.create(video=video_file.video)
+    resource = WebsiteContentFactory.create(website=drive_file.website)
+    resource.save()
+    drive_file.resource = resource
+    drive_file.save()
+    update_youtube_statuses.delay()
+
+    # The following is the combination of statuses that moves the VideoFile
+    # from 'Uploaded' to 'Complete' state. This is when the email should be sent.
+    should_email = (
+        youtube_status == YouTubeStatus.PROCESSED
+        and file_status == VideoFileStatus.UPLOADED
+    )
+
+    assert mock_mail_success.call_count == (1 if should_email else 0)
+
+
+@mock_aws
+def test_delete_s3_objects(settings):
+    """Test that s3 objects are deleted"""
+    settings.AWS_STORAGE_BUCKET_NAME = MOCK_BUCKET_NAME
+
+    test_files = {
+        "biology/config/_default/menus.yaml": "menu content",
+        "biology/content/resources/biology.md": "course content",
+    }
+
+    setup_s3(settings, test_files)
+    client = get_boto3_client("s3")
+    assert (
+        client.get_object(
+            Bucket=MOCK_BUCKET_NAME, Key="biology/config/_default/menus.yaml"
+        )
+        is not None
+    )
+    assert (
+        client.get_object(
+            Bucket=MOCK_BUCKET_NAME, Key="biology/content/resources/biology.md"
+        )
+        is not None
+    )
+    delete_s3_objects(key="biology/config/_default/menus.yaml")
+    with pytest.raises(client.exceptions.NoSuchKey):
+        assert client.get_object(
+            Bucket=MOCK_BUCKET_NAME, Key="biology/config/_default/menus.yaml"
+        )
+    assert (
+        client.get_object(
+            Bucket=MOCK_BUCKET_NAME, Key="biology/content/resources/biology.md"
+        )
+        is not None
+    )
+    delete_s3_objects(key="biology/content")
+    assert (
+        client.get_object(
+            Bucket=MOCK_BUCKET_NAME, Key="biology/content/resources/biology.md"
+        )
+        is not None
+    )
+    delete_s3_objects(key="biology/content", as_filter=True)
+    with pytest.raises(client.exceptions.NoSuchKey):
+        client.get_object(
+            Bucket=MOCK_BUCKET_NAME, Key="biology/content/resources/biology.md"
+        )
+
+
+@pytest.mark.parametrize("update_transcript_return_value", [True, False])
+@pytest.mark.parametrize("is_ocw", [True, False])
+@pytest.mark.parametrize(
+    "initial_status", [VideoStatus.SUBMITTED_FOR_TRANSCRIPTION, VideoStatus.COMPLETE]
+)
+@pytest.mark.parametrize("other_incomplete_video", [True, False])
+def test_update_transcripts_for_video(  # pylint: disable=too-many-arguments  # noqa: PLR0913, PLR0917
+    settings,
+    mocker,
+    update_transcript_return_value,
+    is_ocw,
+    initial_status,
+    other_incomplete_video,
+):
+    """Test update_transcripts_for_video"""
+    mocker.patch("videos.tasks.is_ocw_site", return_value=is_ocw)
+    mocker.patch("websites.api.is_ocw_site", return_value=is_ocw)
+
+    transcripts_notification_mock = mocker.patch(
+        "videos.tasks.mail_transcripts_complete_notification"
+    )
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="expected_id"
+    )
+    video = videofile.video
+    video.pdf_transcript_file = f"{video.website.s3_path}/pdf_transcript"
+    video.webvtt_transcript_file = f"{video.website.s3_path}/webvtt_transcript"
+    video.status = initial_status
+    video.save()
+
+    resource = WebsiteContentFactory.create(website=video.website, metadata={})
+    metadata = resource.metadata
+
+    set_nested_dicts(metadata, settings.FIELD_RESOURCETYPE, RESOURCE_TYPE_VIDEO)
+    set_nested_dicts(metadata, settings.YT_FIELD_ID, "expected_id")
+    set_nested_dicts(metadata, settings.YT_FIELD_CAPTIONS_RESOURCES, None)
+    set_nested_dicts(metadata, settings.YT_FIELD_TRANSCRIPT_RESOURCES, None)
+
+    resource.save()
+
+    if other_incomplete_video:
+        other_resource = WebsiteContentFactory.create(
+            website=video.website, metadata={}
+        )
+        metadata = other_resource.metadata
+        set_nested_dicts(metadata, settings.FIELD_RESOURCETYPE, RESOURCE_TYPE_VIDEO)
+        set_nested_dicts(
+            metadata, f"{settings.YT_FIELD_CAPTIONS_RESOURCES}.content", None
+        )
+        other_resource.save()
+
+    update_transcript_mock = mocker.patch(
+        "videos.tasks.threeplay_api.update_transcripts_for_video",
+        return_value=update_transcript_return_value,
+    )
+
+    def fake_link(video_arg, video_resource_arg):
+        set_dict_field(
+            video_resource_arg.metadata,
+            settings.YT_FIELD_CAPTIONS_RESOURCES,
+            {"content": ["captions-id"], "website": video.website.name},
+        )
+        return True
+
+    link_mock = mocker.patch(
+        "videos.tasks.link_threeplay_files_as_resources", side_effect=fake_link
+    )
+    sync_refs_mock = mocker.patch("videos.tasks.sync_website_content_references")
+
+    update_transcripts_for_video(video.id)
+    update_transcript_mock.assert_called_with(video)
+
+    resource.refresh_from_db()
+
+    if update_transcript_return_value and is_ocw:
+        link_mock.assert_any_call(video, resource)
+        sync_refs_mock.assert_called()
+        assert get_dict_field(
+            resource.metadata, settings.YT_FIELD_CAPTIONS_RESOURCES
+        ) == {"content": ["captions-id"], "website": video.website.name}
+
+        if initial_status == VideoStatus.SUBMITTED_FOR_TRANSCRIPTION and (
+            not other_incomplete_video
+        ):
+            transcripts_notification_mock.assert_called_once()
+        else:
+            transcripts_notification_mock.assert_not_called()
+
+    else:
+        assert (
+            get_dict_field(resource.metadata, settings.YT_FIELD_CAPTIONS_RESOURCES)
+            is None
+        )
+        assert (
+            get_dict_field(resource.metadata, settings.YT_FIELD_TRANSCRIPT_RESOURCES)
+            is None
+        )
+
+
+def test_update_transcripts_for_updated_videos(mocker):
+    """Test update_transcripts_for_updated_videos"""
+
+    video_file = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="reference_id"
+    )
+
+    updated_files_mock = mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_updated_media_file_request",
+        return_value=updated_transctipts_reponse(),
+    )
+    update_transcript_mock = mocker.patch(
+        "videos.tasks.update_transcripts_for_video", return_value=True
+    )
+    remove_tags_mock = mocker.patch("videos.tasks.threeplay_api.threeplay_remove_tags")
+
+    update_transcripts_for_updated_videos()
+
+    updated_files_mock.assert_called_once()
+    update_transcript_mock.assert_called_once_with(video_file.video.id)
+    remove_tags_mock.assert_called_once_with(6737396)
+
+
+@pytest.mark.parametrize(
+    ("caption_exists", "transcript_exists"),
+    [
+        [True, False],  # noqa: PT007
+        [False, True],  # noqa: PT007
+    ],
+)
+def test_update_transcripts_for_video_no_3play(
+    mocker, caption_exists, transcript_exists
+):
+    """If there are caption/transcript resources, avoid calling 3play"""
+    mocker.patch("videos.tasks.is_ocw_site", return_value=True)
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="expected_id"
+    )
+    video = videofile.video
+    resource = WebsiteContentFactory.create(website=video.website, metadata={})
+    metadata = resource.metadata
+    base_resource_filename = get_base_filename(resource.filename)
+    base_path = f"{resource.website.s3_path}/{base_resource_filename}"
+
+    if caption_exists:
+        WebsiteContentFactory.create(
+            website=video.website,
+            filename=f"{base_resource_filename}_captions_vtt",
+            file=f"{base_path}_captions.vtt",
+        )
+
+    if transcript_exists:
+        WebsiteContentFactory.create(
+            website=video.website,
+            filename=f"{base_resource_filename}_transcript_pdf",
+            file=f"{base_path}_transcript.pdf",
+        )
+
+    set_dict_field(metadata, settings.FIELD_RESOURCETYPE, RESOURCE_TYPE_VIDEO)
+    set_dict_field(metadata, settings.YT_FIELD_ID, "expected_id")
+    resource.save()
+
+    captions_list, transcripts_list = video.caption_transcript_resources()
+    if caption_exists:
+        assert len(captions_list) > 0
+    if transcript_exists:
+        assert len(transcripts_list) > 0
+
+    mock_3play = mocker.patch("videos.tasks.threeplay_api.update_transcripts_for_video")
+
+    update_transcripts_for_video(video.id)
+    resource.refresh_from_db()
+
+    mock_3play.assert_not_called()
+
+    # The _resources relation fields are written from the found resources
+    assert get_dict_field(resource.metadata, settings.YT_FIELD_CAPTIONS_RESOURCES) == (
+        {
+            "content": [str(r.text_id) for r in captions_list],
+            "website": video.website.name,
+        }
+        if caption_exists
+        else None
+    )
+    assert get_dict_field(
+        resource.metadata, settings.YT_FIELD_TRANSCRIPT_RESOURCES
+    ) == (
+        {
+            "content": [str(r.text_id) for r in transcripts_list],
+            "website": video.website.name,
+        }
+        if transcript_exists
+        else None
+    )
+
+
+def test_update_transcripts_for_video_no_3play_for_backfill_naming_convention(mocker):
+    """Avoid calling 3play when the orphan backfill already created an English
+    transcript for the video.
+
+    Regression test for the duplicate-resource bug: the backfill names what
+    it creates with the same "{base_stem}_transcript_{ext}" convention GDrive
+    ingestion uses, so caption_transcript_resources() discovers it and 3Play
+    is skipped. Naming it any other way (e.g. off the video's full, unstripped
+    filename) made it invisible here and produced a second English transcript.
+    """
+    mocker.patch("videos.tasks.is_ocw_site", return_value=True)
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="expected_id"
+    )
+    video = videofile.video
+    resource = WebsiteContentFactory.create(website=video.website, metadata={})
+    metadata = resource.metadata
+
+    # What the backfill creates: named off the video's base stem, while the
+    # file itself keeps the orphan's opaque S3 key.
+    base_stem = get_base_filename(resource.filename)
+    linked_transcript = WebsiteContentFactory.create(
+        website=video.website,
+        filename=f"{base_stem}_transcript_pdf",
+        file=f"{resource.website.s3_path}/1AbCdEf_transcript.pdf",
+    )
+
+    set_dict_field(metadata, settings.FIELD_RESOURCETYPE, RESOURCE_TYPE_VIDEO)
+    set_dict_field(metadata, settings.YT_FIELD_ID, "expected_id")
+    set_dict_field(
+        metadata,
+        settings.YT_FIELD_TRANSCRIPT_RESOURCES,
+        {
+            "content": [str(linked_transcript.text_id)],
+            "website": video.website.name,
+        },
+    )
+    resource.save()
+
+    # The base-stem search finds it, which is the point of matching the
+    # convention rather than teaching the gate about a second one.
+    _, transcripts_list = video.caption_transcript_resources()
+    assert transcripts_list == [linked_transcript]
+
+    mock_3play = mocker.patch("videos.tasks.threeplay_api.update_transcripts_for_video")
+
+    update_transcripts_for_video(video.id)
+
+    mock_3play.assert_not_called()
+
+
+def test_update_transcripts_for_video_still_fetches_english_when_only_french_linked(
+    mocker,
+):
+    """A French-only _resources entry must not block fetching the English one.
+
+    Regression test for a stricter, over-eager version of the "already
+    linked" check that treated any existing entry -- regardless of language
+    -- as reason to skip 3Play. 3Play only ever supplies an English
+    transcript/caption, so an existing French one must not prevent it.
+    """
+    mocker.patch("videos.tasks.is_ocw_site", return_value=True)
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="expected_id"
+    )
+    video = videofile.video
+    resource = WebsiteContentFactory.create(website=video.website, metadata={})
+    metadata = resource.metadata
+
+    french_transcript = WebsiteContentFactory.create(
+        website=video.website,
+        filename=f"{resource.filename}_transcript-fr_pdf",
+        file=f"{resource.website.s3_path}/{resource.filename}_transcript-fr.pdf",
+    )
+
+    set_dict_field(metadata, settings.FIELD_RESOURCETYPE, RESOURCE_TYPE_VIDEO)
+    set_dict_field(metadata, settings.YT_FIELD_ID, "expected_id")
+    set_dict_field(
+        metadata,
+        settings.YT_FIELD_TRANSCRIPT_RESOURCES,
+        {
+            "content": [str(french_transcript.text_id)],
+            "website": video.website.name,
+        },
+    )
+    resource.save()
+
+    mock_3play = mocker.patch(
+        "videos.tasks.threeplay_api.update_transcripts_for_video", return_value=False
+    )
+
+    update_transcripts_for_video(video.id)
+
+    mock_3play.assert_called_once_with(video)
+
+
+@pytest.mark.django_db
+def test_update_transcripts_for_video_multi_language_with_locale(mocker):
+    """All language variants matching the dash convention are linked via _resources."""
+    mocker.patch("videos.tasks.is_ocw_site", return_value=True)
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="expected_id"
+    )
+    video = videofile.video
+    resource = WebsiteContentFactory.create(website=video.website, metadata={})
+    base_resource_filename = get_base_filename(resource.filename)
+    base_path = f"{resource.website.s3_path}/{base_resource_filename}"
+
+    # English (US locale) captions
+    captions_en_us = WebsiteContentFactory.create(
+        website=video.website,
+        filename=f"{base_resource_filename}_captions-en-us_vtt",
+        file=f"{base_path}_captions-en-US.vtt",
+    )
+    # French (CA locale) captions
+    captions_fr = WebsiteContentFactory.create(
+        website=video.website,
+        filename=f"{base_resource_filename}_captions-fr-ca_vtt",
+        file=f"{base_path}_captions-fr-CA.vtt",
+    )
+
+    set_dict_field(resource.metadata, settings.FIELD_RESOURCETYPE, RESOURCE_TYPE_VIDEO)
+    set_dict_field(resource.metadata, settings.YT_FIELD_ID, "expected_id")
+    resource.save()
+
+    mocker.patch("videos.tasks.threeplay_api.update_transcripts_for_video")
+
+    update_transcripts_for_video(video.id)
+    resource.refresh_from_db()
+
+    relation = get_dict_field(resource.metadata, settings.YT_FIELD_CAPTIONS_RESOURCES)
+    assert isinstance(relation, dict)
+    assert set(relation["content"]) == {
+        str(captions_en_us.text_id),
+        str(captions_fr.text_id),
+    }
+    assert relation["website"] == video.website.name
+
+
+def test_attempt_to_update_missing_transcripts(mocker):
+    """Test attempt_to_update_missing_transcripts"""
+
+    videofile = VideoFileFactory.create(
+        destination=DESTINATION_YOUTUBE, destination_id="reference_id"
+    )
+    website = videofile.video.website
+    website.publish_date = datetime.now(pytz.timezone("America/New_York"))
+    website.save()
+
+    update_transcript_mock = mocker.patch("videos.tasks.update_transcripts_for_video")
+
+    attempt_to_update_missing_transcripts()
+
+    update_transcript_mock.delay.assert_called_once_with(videofile.video.id)
+
+
+def test_update_transcripts_for_website(mocker):
+    """Test update_transcripts_for_website"""
+    website = WebsiteFactory.create()
+    videos = VideoFactory.create_batch(4, website=website)
+    update_video_transcript = mocker.patch("videos.tasks.update_transcripts_for_video")
+
+    update_transcripts_for_website(website)
+
+    for video in videos:
+        update_video_transcript.assert_any_call(video.id)
+
+
+def test_mail_transcripts_complete_notification(settings, mocker):
+    """mail_transcripts_complete_notification should send correct email to correct users"""
+    website = WebsiteFactory.create()
+    users = UserFactory.create_batch(4)
+    for user in users[:2]:
+        user.groups.add(website.admin_group)
+    for user in users[2:]:
+        user.groups.add(website.editor_group)
+
+    mock_get_message_sender = mocker.patch("videos.tasks.get_message_sender")
+    mock_sender = mock_get_message_sender.return_value.__enter__.return_value
+
+    mail_transcripts_complete_notification(website)
+
+    mock_get_message_sender.assert_called_once_with(VideoTranscriptingCompleteMessage)
+    assert mock_sender.build_and_send_message.call_count == len(users) + 1
+    for user in users:
+        mock_sender.build_and_send_message.assert_any_call(
+            user,
+            {
+                "site": {
+                    "title": website.title,
+                    "url": urljoin(settings.SITE_BASE_URL, f"/sites/{website.name}"),
+                },
+            },
+        )
+
+
+def test_copy_gdrive_file(mocker):
+    """Test that copy_gdrive_file correctly copies a file to a new Google Drive folder."""
+    source_file_id = "sourceFileId"
+    new_file_id = "newFileId"
+    destination_folder_id = "destinationFolderId"
+    original_parent_id = "originalParentId"
+    original_parent_name = "originalParentName"
+    new_parent_id = "newParentId"
+    destination_course = WebsiteFactory.create(gdrive_folder=destination_folder_id)
+    mock_gdrive_file = DriveFileFactory.create(file_id=source_file_id)
+    mock_gdrive_service = mocker.Mock()
+    mocker.patch("videos.tasks.get_drive_service", return_value=mock_gdrive_service)
+    mocker.patch("videos.tasks.query_files", return_value=[{"id": new_parent_id}])
+    mock_gdrive_service.files().get().execute.side_effect = [
+        {"id": source_file_id, "parents": [original_parent_id]},
+        {"name": original_parent_name},
+    ]
+    mock_copy = mocker.Mock()
+    mock_gdrive_service.files().copy = mock_copy
+    mock_copy.return_value.execute.return_value = {"id": new_file_id}
+
+    result = copy_gdrive_file(mock_gdrive_file, destination_course)
+
+    assert result == new_file_id
+    mock_copy.assert_called_once_with(
+        fileId=source_file_id,
+        body={"parents": [new_parent_id]},
+        fields="id, parents",
+        supportsAllDrives=True,
+    )
+
+
+@pytest.mark.django_db
+def test_copy_video_resource_uses_relation_fields(mocker):
+    """copy_video_resource reads captions/transcripts from resource relation fields."""
+
+    mocker.patch("videos.tasks.copy_gdrive_file", return_value=None)
+    mocker.patch("videos.tasks.create_drivefile")
+    mocker.patch("videos.tasks.sync_website_content_references")
+    mocker.patch(
+        "videos.tasks.VideoFile.objects.filter",
+        return_value=mocker.Mock(first=mocker.Mock(return_value=None)),
+    )
+
+    source_course = WebsiteFactory.create()
+    destination_course = WebsiteFactory.create()
+
+    captions_content = WebsiteContentFactory.create(
+        website=source_course,
+        filename="lecture1_captions_en_vtt",
+        is_page_content=True,
+    )
+    transcript_content = WebsiteContentFactory.create(
+        website=source_course,
+        filename="lecture1_transcript_en_pdf",
+        is_page_content=True,
+    )
+
+    source_resource = WebsiteContentFactory.create(
+        website=source_course,
+        metadata={
+            "video_files": {
+                settings.YT_FIELD_CAPTIONS_RESOURCES.split(".")[-1]: {
+                    "content": [str(captions_content.text_id)],
+                    "website": source_course.name,
+                },
+                settings.YT_FIELD_TRANSCRIPT_RESOURCES.split(".")[-1]: {
+                    "content": [str(transcript_content.text_id)],
+                    "website": source_course.name,
+                },
+            }
+        },
+    )
+
+    copy_video_resource(
+        str(source_course.uuid),
+        str(destination_course.uuid),
+        str(source_resource.text_id),
+    )
+
+    # New resource should exist in destination and have relation fields set
+    new_resource = (
+        WebsiteContent.objects.filter(
+            website=destination_course,
+            type=source_resource.type,
+        )
+        .exclude(text_id=source_resource.text_id)
+        .first()
+    )
+    assert new_resource is not None
+
+    captions_relation = new_resource.metadata["video_files"].get(
+        settings.YT_FIELD_CAPTIONS_RESOURCES.split(".")[-1]
+    )
+    assert captions_relation is not None
+    assert captions_relation["website"] == destination_course.name
+    assert len(captions_relation["content"]) == 1
+
+    transcript_relation = new_resource.metadata["video_files"].get(
+        settings.YT_FIELD_TRANSCRIPT_RESOURCES.split(".")[-1]
+    )
+    assert transcript_relation is not None
+    assert transcript_relation["website"] == destination_course.name
+
+
+def test_create_drivefile(mocker):
+    """Test that create_drivefile correctly creates a DriveFile for a given Google Drive file in the destination course."""
+    mock_gdrive_file = DriveFileFactory.create()
+    new_resource = WebsiteContentFactory.create(
+        file="/path/to/file", metadata={"file_type": "application/pdf"}
+    )
+    destination_course = WebsiteFactory.create()
+    mock_gdrive_service = mocker.Mock()
+    mock_gdrive_dl = {
+        DRIVE_FILE_ID: "file_id",
+        DRIVE_FILE_MD5_CHECKSUM: "checksum",
+        DRIVE_FILE_MODIFIED_TIME: "modified_time",
+        DRIVE_FILE_CREATED_TIME: "created_time",
+        DRIVE_FILE_SIZE: "size",
+        DRIVE_FILE_DOWNLOAD_LINK: "download_link",
+    }
+    files_or_videos = "files"
+    mock_get_drive_service = mocker.patch(
+        "videos.tasks.get_drive_service", return_value=mock_gdrive_service
+    )
+    mock_get_gdrive_file = mocker.patch(
+        "videos.tasks.get_gdrive_file", return_value=mock_gdrive_dl
+    )
+    mock_update_or_create = mocker.patch.object(DriveFile.objects, "update_or_create")
+
+    create_drivefile(
+        mock_gdrive_file.file_id, new_resource, destination_course, files_or_videos
+    )
+
+    mock_get_drive_service.assert_called_once()
+    mock_get_gdrive_file.assert_called_once_with(
+        mock_gdrive_service, mock_gdrive_file.file_id
+    )
+    mock_update_or_create.assert_called_once()
+
+    actual_call_args = mock_update_or_create.call_args[1]
+    assert isinstance(actual_call_args["defaults"]["sync_dt"], datetime)
+    actual_call_args["defaults"].pop("sync_dt")
+
+    assert actual_call_args == {
+        "file_id": "file_id",
+        "defaults": {
+            "checksum": mock_gdrive_dl.get(DRIVE_FILE_MD5_CHECKSUM),
+            "name": get_resource_name(new_resource),
+            "mime_type": new_resource.metadata["file_type"],
+            "status": DriveFileStatus.COMPLETE,
+            "website": destination_course,
+            "s3_key": str(new_resource.file).lstrip("/"),
+            "resource": new_resource,
+            "drive_path": (f"{destination_course.short_id}/files_final"),
+            "modified_time": mock_gdrive_dl.get(DRIVE_FILE_MODIFIED_TIME),
+            "created_time": mock_gdrive_dl.get(DRIVE_FILE_CREATED_TIME),
+            "size": mock_gdrive_dl.get(DRIVE_FILE_SIZE),
+            "download_link": mock_gdrive_dl.get(DRIVE_FILE_DOWNLOAD_LINK),
+        },
+    }
+
+
+def test_start_transcript_job_retry_on_connection_error(mocker, settings):
+    """Test that start_transcript_job retries on connection errors"""
+    youtube_id = "test"
+    title = "title"
+
+    video = create_video(youtube_id, title)
+    create_content(video.website, youtube_id, title)
+
+    # Mock the retry method to capture retry calls
+    mock_retry = mocker.patch("videos.tasks.start_transcript_job.retry")
+    mock_retry.side_effect = Retry("Retry called")
+
+    # Mock 3Play upload to raise a connection error
+    mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_upload_video_request",
+        side_effect=requests.exceptions.ConnectionError("Connection failed"),
+    )
+
+    # Test that the task calls retry when a connection error occurs
+    with pytest.raises(Retry, match="Retry called"):
+        start_transcript_job.apply([video.id])
+
+    mock_retry.assert_called_once()
+
+
+def test_start_transcript_job_retry_on_timeout_error(mocker, settings):
+    """Test that start_transcript_job retries on timeout errors with increased timeout"""
+    youtube_id = "test"
+    title = "title"
+
+    video = create_video(youtube_id, title)
+    create_content(video.website, youtube_id, title)
+
+    # Mock the retry method to capture retry calls
+    mock_retry = mocker.patch("videos.tasks.start_transcript_job.retry")
+    mock_retry.side_effect = Retry("Retry called")
+
+    # Mock 3Play upload to raise a timeout error
+    mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_upload_video_request",
+        side_effect=requests.exceptions.Timeout("Request timed out"),
+    )
+
+    # Create a mock task instance with proper request mock
+    mock_task = mocker.Mock()
+    mock_task.request = mocker.Mock(retries=0)
+
+    # Test that the task calls retry when a timeout error occurs
+    with pytest.raises(Retry, match="Retry called"):
+        start_transcript_job.apply([video.id])
+
+    # Verify retry was called with timeout exception and increased timeout
+    mock_retry.assert_called_once()
+    call_args = mock_retry.call_args
+    assert "exc" in call_args[1]
+    assert isinstance(call_args[1]["exc"], requests.exceptions.Timeout)
+    assert "kwargs" in call_args[1]
+    assert (
+        call_args[1]["kwargs"]["timeout_override"]
+        == settings.THREEPLAY_BASE_TIMEOUT * 2
+    )
+
+
+def test_start_transcript_job_no_retry_on_unexpected_error(mocker, settings):
+    """Test that start_transcript_job doesn't retry on unexpected errors"""
+    youtube_id = "test"
+    title = "title"
+
+    video = create_video(youtube_id, title)
+    create_content(video.website, youtube_id, title)
+
+    # Mock the retry method to capture retry calls
+    mock_retry = mocker.patch("videos.tasks.start_transcript_job.retry")
+
+    # Mock 3Play upload to raise an unexpected error
+    mocker.patch(
+        "videos.tasks.threeplay_api.threeplay_upload_video_request",
+        side_effect=ValueError("Unexpected error"),
+    )
+
+    # Test that the task doesn't retry on unexpected errors
+    with pytest.raises(ValueError, match="Unexpected error"):
+        start_transcript_job.apply([video.id])
+
+    mock_retry.assert_not_called()
+
+
+def _mock_redis_lock(mocker, *, acquire_returns, locked_returns):
+    """Set up a mock Redis lock for the @single_task decorator."""
+    mock_lock = mocker.MagicMock()
+    mock_lock.acquire.return_value = acquire_returns
+    mock_lock.locked.return_value = locked_returns
+    mock_redis = mocker.MagicMock()
+    mock_redis.lock.return_value = mock_lock
+    mocker.patch(
+        "content_sync.decorators.get_redis_connection", return_value=mock_redis
+    )
+    return mock_lock
+
+
+@pytest.fixture(autouse=False)
+def allow_single_task_lock(mocker):
+    """Grant the @single_task Redis lock so tests run unimpeded."""
+    return _mock_redis_lock(mocker, acquire_returns=True, locked_returns=True)
+
+
+@pytest.mark.usefixtures("allow_single_task_lock")
+def test_ytags_batch_updates_tags_and_saves_to_db(mocker, settings):
+    """Task updates YouTube tags and saves merged tags to DB."""
+    settings.YT_ACCESS_TOKEN = "token"  # noqa: S105
+    settings.YT_REFRESH_TOKEN = "refresh"  # noqa: S105
+    settings.YT_CLIENT_ID = "client_id"
+    settings.YT_CLIENT_SECRET = "secret"  # noqa: S105
+    settings.YT_PROJECT_ID = "project"
+
+    website = WebsiteFactory.create(name="test-course")
+    video = VideoFactory.create(website=website)
+    VideoFileFactory.create(
+        video=video,
+        destination=DESTINATION_YOUTUBE,
+        destination_id="yt_batch_1",
+    )
+    content = WebsiteContentFactory.create(
+        website=website,
+        title="Test Video",
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_id": "yt_batch_1",
+                "video_tags": "python, django",
+            },
+        },
+    )
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+    mock_api = mock_api_cls.return_value
+    mock_api.client.videos.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "yt_batch_1", "snippet": {"tags": ["machine-learning"]}}]
+    }
+
+    update_youtube_tags_batch(["yt_batch_1"])
+
+    mock_api.client.videos.return_value.update.return_value.execute.assert_called()
+
+    content.refresh_from_db()
+    tags = content.metadata["video_metadata"]["video_tags"]
+    assert "python" in tags
+    assert "django" in tags
+    assert "machine-learning" in tags
+
+
+@pytest.mark.usefixtures("allow_single_task_lock")
+def test_ytags_batch_skips_when_no_tag_changes(mocker, settings):
+    """Task skips YouTube update when tags are already identical."""
+    settings.YT_ACCESS_TOKEN = "token"  # noqa: S105
+    settings.YT_REFRESH_TOKEN = "refresh"  # noqa: S105
+    settings.YT_CLIENT_ID = "client_id"
+    settings.YT_CLIENT_SECRET = "secret"  # noqa: S105
+    settings.YT_PROJECT_ID = "project"
+
+    website = WebsiteFactory.create(name="test-course")
+    video = VideoFactory.create(website=website)
+    VideoFileFactory.create(
+        video=video,
+        destination=DESTINATION_YOUTUBE,
+        destination_id="yt_skip",
+    )
+    WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_id": "yt_skip",
+                "video_tags": "python, django",
+            },
+        },
+    )
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+    mock_api = mock_api_cls.return_value
+    mock_api.client.videos.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "yt_skip", "snippet": {"tags": ["python", "django"]}}]
+    }
+
+    update_youtube_tags_batch(["yt_skip"])
+
+    mock_api.client.videos.return_value.update.return_value.execute.assert_not_called()
+
+
+@pytest.mark.usefixtures("allow_single_task_lock")
+def test_ytags_batch_skips_when_youtube_disabled(mocker, settings):
+    """Task returns early when YouTube integration is disabled."""
+    settings.YT_ACCESS_TOKEN = ""
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+
+    update_youtube_tags_batch(["yt_1"])
+
+    mock_api_cls.assert_not_called()
+
+
+@pytest.mark.usefixtures("allow_single_task_lock")
+def test_ytags_batch_handles_missing_video_on_youtube(mocker, settings):
+    """Videos not found on YouTube are skipped gracefully without raising."""
+    settings.YT_ACCESS_TOKEN = "token"  # noqa: S105
+    settings.YT_REFRESH_TOKEN = "refresh"  # noqa: S105
+    settings.YT_CLIENT_ID = "client_id"
+    settings.YT_CLIENT_SECRET = "secret"  # noqa: S105
+    settings.YT_PROJECT_ID = "project"
+
+    website = WebsiteFactory.create(name="test-course")
+    video = VideoFactory.create(website=website)
+    VideoFileFactory.create(
+        video=video,
+        destination=DESTINATION_YOUTUBE,
+        destination_id="yt_missing",
+    )
+    WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_id": "yt_missing",
+                "video_tags": "tag1",
+            },
+        },
+    )
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+    mock_api = mock_api_cls.return_value
+    mock_api.client.videos.return_value.list.return_value.execute.return_value = {
+        "items": []
+    }
+
+    update_youtube_tags_batch(["yt_missing"])
+
+    mock_api.client.videos.return_value.update.return_value.execute.assert_not_called()
+
+
+@pytest.mark.usefixtures("allow_single_task_lock")
+def test_ytags_batch_add_course_tag(mocker, settings):
+    """add_course_tag=True adds the course slug to the merged tag set."""
+    settings.YT_ACCESS_TOKEN = "token"  # noqa: S105
+    settings.YT_REFRESH_TOKEN = "refresh"  # noqa: S105
+    settings.YT_CLIENT_ID = "client_id"
+    settings.YT_CLIENT_SECRET = "secret"  # noqa: S105
+    settings.YT_PROJECT_ID = "project"
+
+    website = WebsiteFactory.create(name="test-course", url_path="test-course")
+    video = VideoFactory.create(website=website)
+    VideoFileFactory.create(
+        video=video,
+        destination=DESTINATION_YOUTUBE,
+        destination_id="yt_course_tag",
+    )
+    content = WebsiteContentFactory.create(
+        website=website,
+        title="Course Tag Video",
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_id": "yt_course_tag",
+                "video_tags": "python",
+            },
+        },
+    )
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+    mock_api = mock_api_cls.return_value
+    mock_api.client.videos.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "yt_course_tag", "snippet": {"tags": ["python"]}}]
+    }
+
+    update_youtube_tags_batch(["yt_course_tag"], add_course_tag=True)
+
+    mock_api.client.videos.return_value.update.return_value.execute.assert_called()
+
+    content.refresh_from_db()
+    tags = content.metadata["video_metadata"]["video_tags"]
+    assert "python" in tags
+    assert "test-course" in tags
+
+
+def test_ytags_batch_skips_when_lock_already_held(mocker, settings):
+    """When another instance holds the @single_task lock, the task exits silently."""
+    settings.YT_ACCESS_TOKEN = "token"  # noqa: S105
+
+    _mock_redis_lock(mocker, acquire_returns=False, locked_returns=False)
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+
+    update_youtube_tags_batch(["yt_concurrent"])
+
+    mock_api_cls.assert_not_called()
+
+
+@pytest.mark.usefixtures("allow_single_task_lock")
+def test_ytags_batch_duplicate_skips_yt_update(mocker, settings):
+    """
+    A duplicate delivery after the original completes makes videos.list calls
+    but not videos.update — process_video_tags detects no changes.
+    """
+    settings.YT_ACCESS_TOKEN = "token"  # noqa: S105
+    settings.YT_REFRESH_TOKEN = "refresh"  # noqa: S105
+    settings.YT_CLIENT_ID = "client_id"
+    settings.YT_CLIENT_SECRET = "secret"  # noqa: S105
+    settings.YT_PROJECT_ID = "project"
+
+    website = WebsiteFactory.create(name="test-course")
+    video = VideoFactory.create(website=website)
+    VideoFileFactory.create(
+        video=video,
+        destination=DESTINATION_YOUTUBE,
+        destination_id="yt_dup_2",
+    )
+    WebsiteContentFactory.create(
+        website=website,
+        metadata={
+            "resourcetype": RESOURCE_TYPE_VIDEO,
+            "video_metadata": {
+                "youtube_id": "yt_dup_2",
+                "video_tags": "python",
+            },
+        },
+    )
+
+    mock_api_cls = mocker.patch("videos.tasks.YouTubeApi")
+    mock_api = mock_api_cls.return_value
+    mock_api.client.videos.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "yt_dup_2", "snippet": {"tags": ["python"]}}]
+    }
+
+    update_youtube_tags_batch(["yt_dup_2"])
+
+    mock_api.client.videos.return_value.list.return_value.execute.assert_called()
+    mock_api.client.videos.return_value.update.return_value.execute.assert_not_called()

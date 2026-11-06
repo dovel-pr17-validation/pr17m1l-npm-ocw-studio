@@ -1,0 +1,62 @@
+import Plugin from "@ckeditor/ckeditor5-core/src/plugin"
+import ButtonView from "@ckeditor/ckeditor5-ui/src/button/buttonview"
+
+import {
+  ADD_RESOURCE_EMBED,
+  ADD_RESOURCE_LINK,
+  RESOURCE_LINK,
+  CKEDITOR_RESOURCE_UTILS,
+  RESOURCE_EMBED,
+} from "./constants"
+import { getOcwConfig } from "./util"
+
+/**
+ * Plugin for opening the ResourcePicker
+ *
+ * This basically just plucks the `openResourcePicker` callback
+ * out of our `resourceEmbed` object on `editor.config` and then
+ * adds a button to the toolbar which will call that cb on click.
+ */
+export default class ResourcePicker extends Plugin {
+  init(): void {
+    const editor = this.editor
+
+    // The host app supplies this callback through the editor config. An editor
+    // booted without it still gets the buttons, so call it optionally rather
+    // than throwing a TypeError on click.
+    const openResourcePicker = getOcwConfig(
+      this.editor,
+      CKEDITOR_RESOURCE_UTILS,
+    )?.openResourcePicker
+
+    editor.ui.componentFactory.add(ADD_RESOURCE_LINK, (locale: any) => {
+      const view = new ButtonView(locale)
+
+      view.set({
+        label: "Add link",
+        withText: true,
+      })
+
+      view.on("execute", () => {
+        openResourcePicker?.(RESOURCE_LINK)
+      })
+
+      return view
+    })
+
+    editor.ui.componentFactory.add(ADD_RESOURCE_EMBED, (locale: any) => {
+      const view = new ButtonView(locale)
+
+      view.set({
+        label: "Embed resource",
+        withText: true,
+      })
+
+      view.on("execute", () => {
+        openResourcePicker?.(RESOURCE_EMBED)
+      })
+
+      return view
+    })
+  }
+}

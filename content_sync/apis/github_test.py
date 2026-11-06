@@ -1,0 +1,1351 @@
+"""Github API tests"""
+
+import json
+from hashlib import sha1
+from types import SimpleNamespace
+
+import factory
+import pytest
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management import call_command
+from github import Auth, GithubException, GithubIntegration
+from requests import HTTPError
+
+from content_sync.apis.github import (
+    GIT_DATA_FILEPATH,
+    GithubApiWrapper,
+    find_files_recursive,
+    get_app_installation_id,
+    get_newest_release_tag,
+    get_token,
+    sync_starter_configs,
+    tag_sync_lock,
+)
+from content_sync.backends.github import GithubBackend
+from content_sync.constants import OCW_HUGO_RC_TAG_REGEX
+from content_sync.models import ContentSyncState
+from main import features
+from users.factories import UserFactory
+from websites.constants import STARTER_SOURCE_GITHUB
+from websites.factories import (
+    WebsiteContentFactory,
+    WebsiteFactory,
+    WebsiteStarterFactory,
+)
+from websites.models import WebsiteContent, WebsiteStarter
+from websites.site_config_api import SiteConfig
+
+pytestmark = pytest.mark.django_db
+
+# pylint:disable=redefined-outer-name,protected-access,too-many-arguments,unused-argument
+
+GITHUB_APP_INSTALLATIONS = """[
+  {
+    "id": 376434012,
+    "account": {
+      "login": "testrepo",
+      "id": 654321
+    },
+    "app_id": 123456,
+    "app_slug": "testapp1",
+    "target_id": 654321,
+    "target_type": "Organization",
+    "events": [
+    ],
+    "created_at": "2022-01-19T17:49:09.000Z",
+    "updated_at": "2022-01-19T19:11:17.000Z",
+    "single_file_name": null,
+    "has_multiple_single_files": false
+  },
+  {
+    "id": 276434013,
+    "account": {
+      "login": "testrepo",
+      "id": 654321
+    },
+    "app_id": 100100,
+    "app_slug": "testapp2",
+    "target_id": 543216,
+    "target_type": "Organization",
+    "events": [
+    ],
+    "created_at": "2022-01-19T17:49:09.000Z",
+    "updated_at": "2022-01-19T19:11:17.000Z",
+    "single_file_name": null,
+    "has_multiple_single_files": false
+  }
+]
+"""
+
+
+@pytest.fixture(autouse=True)
+def mock_github_integration(mocker):
+    """Mock the github app request"""
+    mock_get = mocker.patch("content_sync.apis.github.requests.get")
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = json.loads(GITHUB_APP_INSTALLATIONS)
+    mock_integration = mocker.patch("content_sync.apis.github.GithubIntegration")
+    mock_integration.return_value.get_access_token.return_value.token = "gh_token"  # noqa: S105
+
+
+@pytest.fixture
+def db_data():
+    """Fixture that seeds the database with data needed for this test suite"""
+    users = UserFactory.create_batch(2)
+    website = WebsiteFactory.create()
+    website_contents = WebsiteContentFactory.create_batch(
+        5,
+        website=website,
+        updated_by=factory.Iterator([users[0], users[0], users[0], users[1], users[1]]),
+    )
+    for content in website_contents:
+        content.content_sync_state.data = {
+            GIT_DATA_FILEPATH: fake_destination_filepath(content)
+        }
+        content.content_sync_state.save()
+    return SimpleNamespace(
+        users=users, website=website, website_contents=website_contents
+    )
+
+
+@pytest.fixture
+def mock_rsa_key():
+    """Generate a test key"""
+    private_key = rsa.generate_private_key(
+        backend=default_backend(), public_exponent=65537, key_size=2048
+    )
+    return private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+@pytest.fixture
+def mock_api_wrapper(settings, mocker, db_data):
+    """Create a GithubApiWrapper with a mock Github object"""
+    settings.GIT_TOKEN = "faketoken"  # noqa: S105
+    settings.GIT_ORGANIZATION = "fake_org"
+    settings.CONTENT_SYNC_RETRIES = 3
+
+    mocker.patch("content_sync.apis.github.Github", autospec=True)
+    return GithubApiWrapper(
+        website=db_data.website, site_config=SiteConfig(db_data.website.starter.config)
+    )
+
+
+@pytest.fixture
+def mock_github(mocker):
+    """Return a mock Github class"""
+    return mocker.patch("content_sync.apis.github.Github")
+
+
+@pytest.fixture
+def patched_file_serialize(mocker):
+    """Patches function that serializes website content to file contents"""
+    return mocker.patch(
+        "content_sync.apis.github.serialize_content_to_file",
+    )
+
+
+def fake_destination_filepath(website_content: WebsiteContent, *args) -> str:
+    """Returns a fake destination filepath for some WebsiteContent record"""  # noqa: D401
+    return f"path/to/{website_content.filename}.md"
+
+
+@pytest.fixture
+def patched_destination_filepath(mocker):
+    """Patches the get_destination_filepath API function"""
+    return mocker.patch(
+        "content_sync.apis.github.get_destination_filepath", fake_destination_filepath
+    )
+
+
+def test_repo_exists_true(mocker, mock_api_wrapper):
+    """repo_exists should return True"""
+    mock_api_wrapper.org.get_repo.return_value = mocker.Mock()
+    assert mock_api_wrapper.repo_exists() is True
+
+
+def test_repo_exists_false(mock_api_wrapper):
+    """repo_exists should return False"""
+    mock_api_wrapper.org.get_repo.side_effect = GithubException(
+        status=404, data={}, headers={}
+    )
+    assert mock_api_wrapper.repo_exists() is False
+
+
+def test_get_repo(mock_api_wrapper):
+    """get_repo should invoke the appropriate PyGithub call"""
+    mock_api_wrapper.get_repo()
+    mock_api_wrapper.org.get_repo.assert_called_once_with(
+        mock_api_wrapper.website.short_id
+    )
+
+
+def test_get_repo_create(mocker, mock_api_wrapper):
+    """get_repo should create the repo if a 404 is returned"""
+    mock_api_wrapper.org.get_repo.side_effect = [
+        GithubException(status=404, data={}, headers={}),
+        mocker.Mock(),
+    ]
+    mock_api_wrapper.get_repo()
+    mock_api_wrapper.org.create_repo.assert_called_once_with(
+        mock_api_wrapper.website.short_id, auto_init=True
+    )
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"private": True}])
+def test_create_repo(mock_api_wrapper, kwargs):
+    """create_repo should invoke the appropriate PyGithub call"""
+    mock_api_wrapper.create_repo(**kwargs)
+    mock_api_wrapper.org.create_repo.assert_called_once_with(
+        mock_api_wrapper.website.short_id, auto_init=True, **kwargs
+    )
+
+
+def test_create_repo_slow_api(mocker, mock_api_wrapper, mock_branches):
+    """Test that the create_repo function will be retried if it fails initially"""
+    mock_api_wrapper.org.create_repo.side_effect = [
+        GithubException(status=404, data={}, headers={}),
+        GithubException(status=429, data={}, headers={}),
+        mocker.Mock(get_branches=mocker.Mock(return_value=mock_branches[0:1])),
+    ]
+    new_repo = mock_api_wrapper.create_repo()
+    assert mock_api_wrapper.org.create_repo.call_count == 3
+    assert new_repo == mock_api_wrapper.get_repo()
+
+
+def test_create_repo_broken_api(mock_api_wrapper):
+    """Test that the create_repo function fails if the Github API repeatedly fails basic calls"""
+    mock_api_wrapper.org.create_repo.side_effect = GithubException(
+        status=404, data={}, headers={}
+    )
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        mock_api_wrapper.create_repo()
+
+
+def test_get_branches(mock_api_wrapper, mock_branches):
+    """get_branches should return the branches in the website repo"""
+    mock_api_wrapper.org.get_repo.return_value.get_branches.return_value = mock_branches
+    assert next(mock_api_wrapper.get_branches()) == mock_branches[0]
+    assert list(mock_api_wrapper.get_branches()) == mock_branches
+
+
+@pytest.mark.parametrize("delete_source", [True, False])
+def test_create_branch(mocker, mock_api_wrapper, delete_source):
+    """create_branch should make relevant github api calls to create a branch and optionally delete a branch"""
+    source_branch_name = "main"
+    new_branch_name = "preview"
+    mock_repo = mock_api_wrapper.org.get_repo.return_value
+    mock_api_wrapper.create_branch(
+        new_branch_name, source_branch_name, delete_source=delete_source
+    )
+    mock_repo.get_git_ref.assert_called_once_with(f"heads/{source_branch_name}")
+    mock_repo.create_git_ref.assert_called_once_with(
+        f"refs/heads/{new_branch_name}", sha=mocker.ANY
+    )
+    if delete_source:
+        mock_repo.get_git_ref.return_value.delete.assert_called_once()
+    else:
+        mock_repo.get_git_ref.return_value.delete.assert_not_called()
+
+
+def test_rename_branch(mocker, mock_api_wrapper):
+    """rename_branch should call create_branch with delete_source=True"""
+    old_branch = "old_branch"
+    new_branch = "new_branch"
+    mock_api_wrapper.rename_branch(old_branch, new_branch)
+    mock_repo = mock_api_wrapper.org.get_repo.return_value
+    mock_repo.get_git_ref.assert_called_once_with(f"heads/{old_branch}")
+    mock_repo.create_git_ref.assert_called_once_with(
+        f"refs/heads/{new_branch}", sha=mocker.ANY
+    )
+    mock_repo.get_git_ref.return_value.delete.assert_called_once()
+
+
+@pytest.mark.parametrize("is_existing_file", [True, False])
+def test_upsert_content_file(  # noqa: PLR0913, PLR0917
+    mocker,
+    db_data,
+    mock_api_wrapper,
+    patched_file_serialize,
+    patched_destination_filepath,
+    is_existing_file,
+):
+    """upsert_content_file should call the correct Github API method depending on whether or not the file exists"""
+    content = db_data.website_contents[0]
+    mock_repo = mock_api_wrapper.org.get_repo.return_value
+    if is_existing_file:
+        mock_repo.get_contents.return_value.sha.return_value = sha1(  # noqa: S324
+            b"fake_sha"
+        )
+        github_api_method = mock_repo.update_file
+    else:
+        mock_repo.get_contents.side_effect = GithubException(
+            status=422, data={}, headers={}
+        )
+        github_api_method = mock_repo.create_file
+    serialized_contents = "my contents"
+    patched_file_serialize.return_value = serialized_contents
+    mock_api_wrapper.upsert_content_file(content)
+
+    patched_file_serialize.assert_called_once_with(
+        site_config=mock_api_wrapper.site_config, website_content=content
+    )
+    github_api_method.assert_called_once()
+    expected_filepath = fake_destination_filepath(content)
+    if is_existing_file:
+        github_api_method.assert_called_once_with(
+            expected_filepath,
+            f"Update {expected_filepath}",
+            serialized_contents,
+            mock_repo.get_contents.return_value.sha,
+            committer=mocker.ANY,
+            author=mocker.ANY,
+            **{},
+        )
+    else:
+        github_api_method.assert_called_once_with(
+            expected_filepath,
+            f"Create {expected_filepath}",
+            serialized_contents,
+            committer=mocker.ANY,
+            author=mocker.ANY,
+            **{},
+        )
+
+
+@pytest.mark.parametrize("filepath", [None, ""])
+def test_upsert_content_file_no_path(mocker, mock_api_wrapper, db_data, filepath):
+    """upsert_content_file should not call repo.create_file if there is no destination filepath"""
+    mocker.patch(
+        "content_sync.apis.github.get_destination_filepath", return_value=filepath
+    )
+    content = db_data.website_contents[0]
+    mock_api_wrapper.upsert_content_file(content)
+    mock_api_wrapper.org.get_repo.return_value.create_file.assert_not_called()
+
+
+def test_upsert_content_files(mocker, mock_api_wrapper, db_data):
+    """upsert_content_files should upsert all content files for each distinct user in one commit per user"""
+    expected_num_users = 2
+    # Create a record and delete it to test that upsert_content_files_for_user still queries for deleted records
+    content_to_delete = WebsiteContentFactory.create(website=db_data.website)
+    content_to_delete.delete()
+    patched_upsert_for_user = mocker.patch.object(
+        mock_api_wrapper, "upsert_content_files_for_user"
+    )
+    mock_api_wrapper.upsert_content_files()
+    assert patched_upsert_for_user.call_count == (expected_num_users + 1)
+    for user in db_data.users:
+        patched_upsert_for_user.assert_any_call(user.id, None, commit_user=None)
+    patched_upsert_for_user.assert_any_call(None, None, commit_user=None)
+
+
+@pytest.mark.parametrize("override_user", [True, False])
+@pytest.mark.parametrize("is_anonymous", [True, False])
+def test_bulk_sync_commit_attribution(  # noqa: PLR0913, PLR0917
+    settings,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+    override_user,
+    is_anonymous,
+):
+    """A maintenance actor overrides commit identity without changing content editors."""
+    settings.FEATURES[features.GIT_ANONYMOUS_COMMITS] = is_anonymous
+    patched_file_serialize.return_value = "serialized content"
+    operator = UserFactory.create() if override_user else None
+    editors = {
+        content.id: (content.owner_id, content.updated_by_id)
+        for content in db_data.website_contents
+    }
+
+    mock_api_wrapper.upsert_content_files(commit_user=operator)
+
+    commits = mock_api_wrapper.get_repo().create_git_commit.call_args_list
+    assert len(commits) == len(db_data.users)
+    expected_users = [operator] * len(db_data.users) if operator else db_data.users
+    expected_identities = sorted(
+        (
+            f"user_{user.id}" if is_anonymous else user.name,
+            settings.GIT_DEFAULT_USER_EMAIL if is_anonymous else user.email,
+        )
+        for user in expected_users
+    )
+    for field in ("author", "committer"):
+        assert (
+            sorted(
+                (
+                    call.kwargs[field]._identity["name"],  # noqa: SLF001
+                    call.kwargs[field]._identity["email"],  # noqa: SLF001
+                )
+                for call in commits
+            )
+            == expected_identities
+        )
+    for content in db_data.website_contents:
+        content.refresh_from_db()
+        assert (content.owner_id, content.updated_by_id) == editors[content.id]
+        assert content.content_sync_state.is_synced
+
+
+@pytest.mark.parametrize("per_user", [True, False])
+def test_bulk_sync_empty_selection(mock_api_wrapper, db_data, per_user):
+    """An empty explicit selection never syncs other dirty content."""
+    query_set = WebsiteContent.objects.none()
+    if per_user:
+        mock_api_wrapper.upsert_content_files_for_user(
+            db_data.users[0].id, query_set, commit_user=db_data.users[1]
+        )
+    else:
+        mock_api_wrapper.upsert_content_files(query_set, commit_user=db_data.users[1])
+    mock_api_wrapper.org.get_repo.assert_not_called()
+
+
+def test_reset_and_sync_attribution(  # noqa: PLR0913, PLR0917
+    settings,
+    mocker,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+):
+    """Reset, rename, resync and orphan cleanup all retain the maintenance actor."""
+    settings.CONTENT_SYNC_BACKEND = "content_sync.backends.github.GithubBackend"
+    settings.FEATURES[features.GIT_ANONYMOUS_COMMITS] = False
+    patched_file_serialize.return_value = "serialized content"
+    operator = UserFactory.create()
+    content = db_data.website_contents[0]
+    old_path = fake_destination_filepath(content)
+    ContentSyncState.objects.filter(content__website=db_data.website).update(
+        synced_checksum="previously-synced"
+    )
+    content.filename = "corrected-filename"
+    content.updated_by = operator
+    content.save()
+    backend = GithubBackend(db_data.website)
+    backend.api = mock_api_wrapper
+    mocker.patch(
+        "content_sync.management.commands.sync_website_to_backend.get_sync_backend",
+        return_value=backend,
+    )
+    mocker.patch(
+        "content_sync.backends.github.get_destination_filepath",
+        side_effect=fake_destination_filepath,
+    )
+    mocker.patch.object(mock_api_wrapper, "get_all_file_paths", return_value=[old_path])
+    editors = dict(
+        db_data.website.websitecontent_set.values_list("pk", "updated_by_id")
+    )
+
+    call_command(
+        "reset_sync_states",
+        filter=db_data.website.name,
+        skip_sync=True,
+    )
+    call_command(
+        "sync_website_to_backend",
+        filter=db_data.website.name,
+        git_delete=True,
+        user=operator.email,
+    )
+
+    commits = mock_api_wrapper.get_repo().create_git_commit.call_args_list
+    # Three editor groups (including the admin edit) plus orphan removal.
+    assert len(commits) == 4
+    for call in commits:
+        for field in ("author", "committer"):
+            assert call.kwargs[field]._identity == {  # noqa: SLF001
+                "name": operator.name,
+                "email": operator.email,
+            }
+    removed_files = mock_api_wrapper.get_repo().create_git_tree.call_args.args[0]
+    assert [element._identity for element in removed_files] == [  # noqa: SLF001
+        {"path": old_path, "mode": "100644", "type": "blob", "sha": None}
+    ]
+    assert (
+        dict(db_data.website.websitecontent_set.values_list("pk", "updated_by_id"))
+        == editors
+    )
+    assert all(
+        state.is_synced
+        for state in ContentSyncState.objects.filter(content__website=db_data.website)
+    )
+
+
+def test_upsert_content_files_for_user(
+    mocker,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+):
+    """
+    upsert_content_files_for_user should upsert all content files for a user in 1 commit and modify ContentSyncState
+    records to reflect the results.
+    """
+    mock_git_tree_element = mocker.patch("content_sync.apis.github.InputGitTreeElement")
+    db_data.website_contents[2].delete()  # ensure we record a delete for the user
+    mock_repo = mock_api_wrapper.org.get_repo.return_value
+    user = db_data.users[0]
+    expected_contents_count = 3
+    expected_contents = db_data.website_contents[0:expected_contents_count]
+    serialized_contents = "my contents"
+    patched_file_serialize.return_value = serialized_contents
+    mock_api_wrapper.upsert_content_files_for_user(user.id)
+
+    assert mock_git_tree_element.call_count == len(expected_contents)
+    for content in expected_contents:
+        if content.deleted:
+            mock_git_tree_element.assert_any_call(
+                fake_destination_filepath(content), "100644", "blob", sha=None
+            )
+        else:
+            mock_git_tree_element.assert_any_call(
+                fake_destination_filepath(content), "100644", "blob", mocker.ANY
+            )
+
+    mock_repo.create_git_commit.assert_called_once_with(
+        "Sync all content",
+        mock_repo.create_git_tree.return_value,
+        [mock_repo.get_git_commit.return_value],
+        committer=mocker.ANY,
+        author=mocker.ANY,
+    )
+
+    for content in expected_contents:
+        if not content.deleted:
+            content.refresh_from_db()
+            assert content.content_sync_state.is_synced is True
+            assert (
+                content.content_sync_state.current_checksum
+                == content.calculate_checksum()
+            )
+
+
+def test_upsert_content_files_for_user_update_checksum(
+    mocker,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+):
+    """
+    upsert_content_files_for_user should upsert all content files for a user in 1 commit and modify ContentSyncState
+    records to reflect the results.
+    """
+    mock_git_tree_element = mocker.patch("content_sync.apis.github.InputGitTreeElement")
+
+    # Set up one of the sync states to be out of date
+    outdated_css = db_data.website_contents[3].content_sync_state
+    outdated_css.current_checksum = ""  # out of date checksum
+    outdated_css.synced_checksum = db_data.website_contents[3].calculate_checksum()
+    outdated_css.save()
+
+    user = db_data.users[1]
+    expected_content = db_data.website_contents[4]
+    mock_api_wrapper.upsert_content_files_for_user(user.id)
+
+    assert mock_git_tree_element.call_count == 1
+    mock_git_tree_element.assert_called_once_with(
+        fake_destination_filepath(db_data.website_contents[4]),
+        "100644",
+        "blob",
+        mocker.ANY,
+    )
+    with pytest.raises(AssertionError):
+        mock_git_tree_element.assert_called_once_with(
+            fake_destination_filepath(db_data.website_contents[3]),
+            "100644",
+            "blob",
+            mocker.ANY,
+        )
+
+    expected_content.refresh_from_db()
+    assert expected_content.content_sync_state.is_synced is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ["markdown", "NEW"],  # noqa: PT007
+        ["metadata", {"foo": 2}],  # noqa: PT007
+        ["dirpath", "brand/new/dirpath"],  # noqa: PT007
+        ["filename", "brand-new-test-case-filename"],  # noqa: PT007
+    ],
+)
+def test_upsert_content_files_modified_only(  # noqa: PLR0913, PLR0917
+    mocker,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+    field,
+    value,
+):
+    """upsert_content_files_for_user should process only the file with a modified field"""
+    mock_git_tree_element = mocker.patch("content_sync.apis.github.InputGitTreeElement")
+    user = db_data.users[0]
+    expected_contents_count = 3
+    website_contents = [
+        content for content in db_data.website_contents if content.updated_by == user
+    ]
+    assert len(website_contents) == expected_contents_count
+
+    # Make all content appear to be synced
+    for content in website_contents:
+        content_sync = content.content_sync_state
+        content_sync.synced_checksum = content_sync.content.calculate_checksum()
+        content_sync.save()
+
+    # Update the field for one WebsiteContent object
+    content = website_contents[0]
+    setattr(content, field, value)
+    content.save()
+
+    mock_api_wrapper.upsert_content_files_for_user(user.id)
+    mock_git_tree_element.assert_any_call(
+        fake_destination_filepath(content), "100644", "blob", mocker.ANY
+    )
+
+    content.refresh_from_db()
+    assert content.content_sync_state.is_synced is True
+
+
+def test_upsert_content_files_modified_filepath(
+    mocker,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+):
+    """upsert_content_files_for_user should save git filepath in sync state and remove old paths from git"""
+    mock_git_tree_element = mocker.patch("content_sync.apis.github.InputGitTreeElement")
+    user = db_data.users[0]
+    content = db_data.website_contents[0]
+    old_filepath = fake_destination_filepath(content)
+    sync_state = content.content_sync_state
+    mock_api_wrapper.upsert_content_files_for_user(user.id)
+
+    sync_state.refresh_from_db()
+    assert sync_state.data[GIT_DATA_FILEPATH] == old_filepath
+    content.filename = "new-test-case-filename.xyz"
+    # NOTE: This test case relies on the fact that this change triggers the creation of a new ContentSyncState
+    content.save()
+    new_filepath = fake_destination_filepath(content)
+    mock_api_wrapper.upsert_content_files_for_user(user.id)
+
+    mock_git_tree_element.assert_any_call(new_filepath, "100644", "blob", mocker.ANY)
+    mock_git_tree_element.assert_any_call(old_filepath, "100644", "blob", sha=None)
+    sync_state.refresh_from_db()
+    assert sync_state.data[GIT_DATA_FILEPATH] == new_filepath
+
+
+def test_upsert_content_files_deleted(
+    mocker,
+    mock_api_wrapper,
+    db_data,
+    patched_file_serialize,
+    patched_destination_filepath,
+):
+    """upsert_content_files should process deleted files"""
+    mock_git_tree_element = mocker.patch("content_sync.apis.github.InputGitTreeElement")
+
+    # Make all content appear to be synced
+    for content in db_data.website_contents:
+        content_sync = content.content_sync_state
+        content_sync.synced_checksum = content_sync.content.calculate_checksum()
+        content_sync.data = {
+            "filepath": fake_destination_filepath(content_sync.content)
+        }
+        content_sync.save()
+
+    # Mark the content as soft-deleted
+    content = db_data.website_contents[0]
+    content.delete()
+
+    mock_api_wrapper.upsert_content_files()
+    mock_git_tree_element.assert_called_once_with(
+        fake_destination_filepath(content), "100644", "blob", sha=None
+    )
+
+    assert WebsiteContent.all_objects.filter(id=content.id).exists() is False
+
+
+def test_delete_content_file(mocker, mock_api_wrapper, patched_destination_filepath):
+    """delete_content_file should call repo.delete_file"""
+    content = mock_api_wrapper.website.websitecontent_set.first()
+    mock_repo = mock_api_wrapper.org.get_repo.return_value
+    mock_repo.get_contents.return_value.sha.return_value = sha1(  # noqa: S324
+        b"fake_sha"
+    )
+    mock_api_wrapper.delete_content_file(content)
+    expected_filepath = fake_destination_filepath(content)
+    mock_repo.delete_file.assert_called_once_with(
+        expected_filepath,
+        f"Delete {expected_filepath}",
+        mock_repo.get_contents.return_value.sha,
+        committer=mocker.ANY,
+        **{},
+    )
+
+
+def test_merge_branches(mock_api_wrapper):
+    """merge_branches should call repo.merge with correct arguments"""
+    mock_repo = mock_api_wrapper.org.get_repo.return_value
+    mock_api_wrapper.merge_branches("from_branch", "to_branch")
+    mock_repo.merge.assert_called_once_with(
+        "to_branch",
+        mock_repo.get_branch.return_value.commit.sha,
+        "Merge from_branch to to_branch",
+    )
+
+
+@pytest.mark.parametrize("use_app", [True, False])
+def test_get_token(settings, mocker, mock_rsa_key, use_app):
+    """Should return either a hardcoded token or github app token, based on settings"""
+    settings.GIT_TOKEN = "abc123"  # noqa: S105
+    settings.GITHUB_APP_ID = 123456 if use_app else None
+    settings.GITHUB_APP_PRIVATE_KEY = mock_rsa_key
+    github_app_token = "gh_token"  # noqa: S105
+    mock_get_app_installation_id = mocker.patch(
+        "content_sync.apis.github.get_app_installation_id", return_value=123
+    )
+    mock_integration = mocker.patch("content_sync.apis.github.GithubIntegration")
+    mock_integration.return_value.get_access_token.return_value.token = github_app_token
+    token = get_token()
+    assert mock_get_app_installation_id.call_count == (1 if use_app else 0)
+    assert mock_integration.call_count == (1 if use_app else 0)
+    assert token == (github_app_token if use_app else settings.GIT_TOKEN)
+
+
+def test_get_token_misconfigured(settings):
+    """Should raise ImproperlyConfigured if both GIT_TOKEN and GITHUB_APP_ID are None"""
+    settings.GIT_TOKEN = None
+    settings.GITHUB_APP_ID = None
+    settings.GITHUB_APP_PRIVATE_KEY = "fake_key"
+    with pytest.raises(ImproperlyConfigured) as exc:
+        get_token()
+    assert (
+        exc.value.args[0]
+        == "Missing Github settings, a token or app id and private key are required"
+    )
+
+
+def test_get_token_bad_private_key(settings):
+    """Should raise ImproperlyConfigured if GITHUB_APP_PRIVATE_KEY is not a valid encoded key"""
+    settings.GITHUB_APP_ID = 12
+    settings.GITHUB_APP_PRIVATE_KEY = "not_a_valid_key"
+    with pytest.raises(ImproperlyConfigured) as exc:
+        get_token()
+    assert (
+        exc.value.args[0]
+        == "Could not initialize github app, check the relevant settings"
+    )
+
+
+def test_get_token_401(settings, mocker, mock_rsa_key):
+    """Should raise ImproperlyConfigured if github returns an error response"""
+    settings.GITHUB_APP_ID = 12
+    settings.GITHUB_APP_PRIVATE_KEY = mock_rsa_key
+    mocker.patch("content_sync.apis.github.GithubIntegration")
+    mocker.patch(
+        "content_sync.apis.github.requests.get",
+        side_effect=HTTPError(
+            response=mocker.Mock(
+                status_code=401,
+                json=mocker.Mock(return_value="A valid JWT token could not be decoded"),
+            )
+        ),
+    )
+    with pytest.raises(ImproperlyConfigured) as exc:
+        get_token()
+    assert (
+        exc.value.args[0]
+        == "Could not initialize github app, check the relevant settings"
+    )
+
+
+@pytest.mark.parametrize(
+    ("app_id", "install_id"),
+    [[789012, None], [100100, 276434013], [123456, 376434012]],  # noqa: PT007
+)
+def test_get_app_installation_id(settings, mocker, mock_rsa_key, app_id, install_id):
+    """Should return the installation id based on matching app id returned in a response from Github"""
+    settings.GITHUB_APP_ID = app_id
+    settings.GITHUB_APP_PRIVATE_KEY = mock_rsa_key
+    installation_id = get_app_installation_id(
+        GithubIntegration(
+            auth=Auth.AppAuth(settings.GITHUB_APP_ID, mock_rsa_key.decode())
+        )
+    )
+    assert installation_id == install_id
+
+
+@pytest.mark.parametrize(
+    ("app_id", "install_id"),
+    [[None, None]],  # noqa: PT007
+)
+def test_invalid_app_installation_id(
+    settings, mocker, mock_rsa_key, app_id, install_id
+):
+    """Should return the installation id based on matching app id returned in a response from Github"""
+    settings.GITHUB_APP_ID = app_id
+    settings.GITHUB_APP_PRIVATE_KEY = mock_rsa_key
+    with pytest.raises(AssertionError):
+        get_app_installation_id(
+            GithubIntegration(
+                auth=Auth.AppAuth(settings.GITHUB_APP_ID, mock_rsa_key.decode())
+            )
+        )
+
+
+@pytest.mark.parametrize("is_anonymous", [True, False])
+def test_git_user(settings, mock_api_wrapper, is_anonymous):
+    """git_user should return an InputGitAuthor with expected name and email"""
+    settings.FEATURES[features.GIT_ANONYMOUS_COMMITS] = is_anonymous
+    settings.GIT_DEFAULT_USER_NAME = "GitUser"
+    settings.GIT_DEFAULT_USER_EMAIL = "GitUser@git.edu"
+    user = UserFactory.create()
+    git_author = mock_api_wrapper.git_user(user)
+    if is_anonymous:
+        assert git_author._identity == {  # noqa: SLF001
+            "name": f"user_{user.id}",
+            "email": settings.GIT_DEFAULT_USER_EMAIL,
+        }
+    else:
+        assert git_author._identity == {  # noqa: SLF001
+            "name": user.name,
+            "email": user.email,
+        }
+
+    git_author_none = mock_api_wrapper.git_user(None)
+    assert git_author_none._identity == {  # noqa: SLF001
+        "name": settings.GIT_DEFAULT_USER_NAME,
+        "email": settings.GIT_DEFAULT_USER_EMAIL,
+    }
+
+
+@pytest.mark.parametrize("git_url", ["http://github.example.edu/api/v3", None])
+def test_custom_github_url(mocker, settings, git_url):
+    """The github api wrapper should use the GIT_API_URL specified in settings or a default"""
+    settings.GITHUB_TIMEOUT = 30
+    settings.GITHUB_APP_ID = None
+    settings.GIT_API_URL = git_url
+    settings.GIT_TOKEN = "abcdef"  # noqa: S105
+    mock_github = mocker.patch("content_sync.apis.github.Github", autospec=True)
+    GithubApiWrapper(website=mocker.Mock(), site_config=mocker.Mock())
+    if git_url:
+        mock_github.assert_called_once_with(
+            login_or_token=settings.GIT_TOKEN,
+            base_url=settings.GIT_API_URL,
+            timeout=settings.GITHUB_TIMEOUT,
+        )
+    else:
+        mock_github.assert_called_once_with(
+            login_or_token=settings.GIT_TOKEN, timeout=settings.GITHUB_TIMEOUT
+        )
+
+
+def test_create_repo_new(mocker, mock_api_wrapper, mock_branches):
+    """Test that the create_repo function completes without errors and calls expected api functions"""
+    mock_api_wrapper.org.create_repo.return_value = mocker.Mock(
+        default_branch=settings.GIT_BRANCH_MAIN,
+        get_branches=mocker.Mock(return_value=mock_branches[0:1]),
+    )
+    new_repo = mock_api_wrapper.create_repo()
+    mock_api_wrapper.org.create_repo.assert_called_once_with(
+        mock_api_wrapper.website.short_id, auto_init=True
+    )
+    for branch in [settings.GIT_BRANCH_PREVIEW, settings.GIT_BRANCH_RELEASE]:
+        new_repo.create_git_ref.assert_any_call(f"refs/heads/{branch}", sha=mocker.ANY)
+    with pytest.raises(AssertionError):
+        new_repo.create_git_ref.assert_any_call(
+            f"refs/heads/{settings.GIT_BRANCH_MAIN}", sha=mocker.ANY
+        )
+    assert new_repo == mock_api_wrapper.get_repo()
+
+
+def test_create_repo_again(mocker, mock_api_wrapper):
+    """Test that the create_repo function will try retrieving a repo if api.create_repo fails"""
+    mock_log = mocker.patch("content_sync.apis.github.log.debug")
+    mock_api_wrapper.org.create_repo.side_effect = GithubException(
+        status=422, data={}, headers={}
+    )
+    new_repo = mock_api_wrapper.create_repo()
+    assert new_repo is not None
+    assert mock_api_wrapper.org.get_repo.call_count == 1
+    mock_log.assert_called_once_with(
+        "Repo already exists: %s", mock_api_wrapper.website.name
+    )
+
+
+def test_create_backend_custom_default_branch(
+    settings, mocker, mock_api_wrapper, mock_branches
+):
+    """Test that the create_backend function creates a custom default branch name"""
+    settings.GIT_BRANCH_MAIN = "testing"
+    mock_api_wrapper.org.create_repo.return_value = mocker.Mock(
+        default_branch="main", get_branches=mocker.Mock(return_value=mock_branches[0:1])
+    )
+    new_repo = mock_api_wrapper.create_repo()
+    for branch in ["testing", settings.GIT_BRANCH_PREVIEW, settings.GIT_BRANCH_RELEASE]:
+        new_repo.create_git_ref.assert_any_call(f"refs/heads/{branch}", sha=mocker.ANY)
+
+
+def test_create_backend_two_branches_already_exist(
+    mocker, mock_api_wrapper, mock_branches
+):
+    """Test that the create_backend function only creates branches that don't exist"""
+    mock_api_wrapper.org.create_repo.return_value = mocker.Mock(
+        default_branch=settings.GIT_BRANCH_MAIN,
+        get_branches=mocker.Mock(return_value=mock_branches[0:2]),
+    )
+    new_repo = mock_api_wrapper.create_repo()
+    with pytest.raises(AssertionError):
+        new_repo.create_git_ref.assert_any_call(
+            f"refs/heads/{settings.GIT_BRANCH_PREVIEW}", sha=mocker.ANY
+        )
+    new_repo.create_git_ref.assert_any_call(
+        f"refs/heads/{settings.GIT_BRANCH_RELEASE}", sha=mocker.ANY
+    )
+    assert new_repo == mock_api_wrapper.get_repo()
+
+
+def test_sync_starter_configs_success_create(mocker, mock_github):
+    """sync_starter_configs should successfully create new WebsiteStarter objects"""
+    config_filenames = [
+        "site-1/ocw-studio.yaml",
+        "site-2/ocw-studio.yaml",
+        "ocw-studio.yaml",
+    ]
+    git_url = "https://github.com/testorg/ocws-configs"
+    config_content = b"---\nroot-url-path: sites\ncollections: []"
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.side_effect = [
+        mocker.Mock(path=config_filenames[0], decoded_content=config_content),
+        mocker.Mock(path=config_filenames[1], decoded_content=config_content),
+        mocker.Mock(path=config_filenames[2], decoded_content=config_content),
+    ]
+    sync_starter_configs(git_url, config_filenames)
+    for filename in config_filenames:
+        expected_slug = filename.split("/")[0] if "/" in filename else "ocws-configs"
+        assert WebsiteStarter.objects.filter(
+            source=STARTER_SOURCE_GITHUB,
+            path=f"{git_url}/{expected_slug}",
+            slug=expected_slug,
+            name=expected_slug,
+            config={"root-url-path": "sites", "collections": []},
+        ).exists()
+
+
+def test_sync_starter_configs_success_update(mocker, mock_github):
+    """sync_starter_configs should successfully update a WebsiteStarter object"""
+    git_url = "https://github.com/testorg/ocws-configs"
+    slug = "site-1"
+    config_content = b"---\nroot-url-path: sites\ncollections: []"
+    file_list = [f"{slug}/ocw-studio.yaml"]
+
+    starter = WebsiteStarterFactory.create(
+        source=STARTER_SOURCE_GITHUB,
+        path=f"{git_url}/{slug}",
+        slug=slug,
+        name="Site 1",
+        config={"foo": "bar"},
+    )
+    starter_count = WebsiteStarter.objects.count()
+
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.return_value = mocker.Mock(
+        path=file_list[0], decoded_content=config_content
+    )
+
+    sync_starter_configs(git_url, file_list)
+    assert WebsiteStarter.objects.count() == starter_count
+    starter.refresh_from_db()
+    assert starter.name == "Site 1"
+    assert starter.config == {"root-url-path": "sites", "collections": []}
+
+
+def test_sync_starter_configs_success_partial_failure(mocker, mock_github):
+    """sync_starter_configs should detect & gracefully handle an invalid config"""
+    config_filenames = ["site-1/ocw-studio.yaml", "site-2/ocw-studio.yaml"]
+    git_url = "https://github.com/testorg/ocws-configs"
+    mock_log = mocker.patch("content_sync.apis.github.log.exception")
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.side_effect = [
+        mocker.Mock(
+            path=config_filenames[0],
+            decoded_content=b"---\ncollections: []\nroot-url-path: sites",
+        ),
+        mocker.Mock(
+            path=config_filenames[1], decoded_content=b"---\nfcollections: []\nfoo: bar"
+        ),
+    ]
+    sync_starter_configs(git_url, config_filenames)
+    mock_log.assert_called_once_with(
+        "Invalid site config YAML found in %s", config_filenames[1]
+    )
+    assert WebsiteStarter.objects.filter(
+        source=STARTER_SOURCE_GITHUB,
+        path=f"{git_url}/site-1",
+        slug="site-1",
+        name="site-1",
+        config={"collections": [], "root-url-path": "sites"},
+    ).exists()
+    assert not WebsiteStarter.objects.filter(
+        path=f"{git_url}/site-2",
+    ).exists()
+
+
+def test_sync_starter_configs_exception(mocker, mock_github):
+    """sync_starter_configs should detect & gracefully handle any exception"""
+    config_filenames = ["site-1/ocw-studio.yaml", "site-2/ocw-studio.yaml"]
+    git_url = "https://github.com/testorg/ocws-configs"
+    mock_log = mocker.patch("content_sync.apis.github.log.exception")
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.side_effect = [
+        KeyError("invalid key")
+    ]
+    sync_starter_configs(git_url, config_filenames)
+    for filename in config_filenames:
+        mock_log.assert_any_call("Error processing config file %s", filename)
+
+
+def test_sync_starter_configs_webhook_branch_hash_mismatch(mocker, mock_github):
+    """A push to a branch other than the default branch without GITHUB_WEBHOOK_BRANCH should not trigger a starter update"""
+    git_url = "https://github.com/testorg/ocws-configs"
+    config_filenames = ["site-1/ocw-studio.yaml", "site-2/ocw-studio.yaml"]
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.default_branch.return_value = settings.GIT_BRANCH_MAIN
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_branch.return_value = mocker.Mock(
+        commit=mocker.Mock(sha="abc123")
+    )
+    fake_commit = "def456"
+    sync_starter_configs(git_url, config_filenames, fake_commit)
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.assert_not_called()
+
+
+def test_sync_starter_configs_webhook_branch_hash_match(mocker, mock_github):
+    """
+    A push to the branch set in settings.GITHUB_WEBHOOK_BRANCH should trigger
+    getting that branch and then the config files themselves
+    """
+    git_url = "https://github.com/testorg/ocws-configs"
+    config_filenames = ["site-1/ocw-studio.yaml", "site-2/ocw-studio.yaml"]
+    fake_commit = "abc123"
+    release_branch = "release"
+    config_content = b"---\nroot-url-path: sites\ncollections: []"
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.side_effect = [
+        mocker.Mock(path=config_filenames[0], decoded_content=config_content),
+        mocker.Mock(path=config_filenames[1], decoded_content=config_content),
+    ]
+    settings.GITHUB_WEBHOOK_BRANCH = release_branch
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_branch.return_value = mocker.Mock(
+        commit=mocker.Mock(sha=fake_commit)
+    )
+    sync_starter_configs(git_url, config_filenames, fake_commit)
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_branch.assert_called_once_with(
+        release_branch
+    )
+    for config_file in config_filenames:
+        mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.assert_any_call(
+            config_file, fake_commit
+        )
+
+
+def test_sync_starter_configs_webhook_branch_nohash(mocker, mock_github):
+    """
+    Sync starter with a non-main settings.GITHUB_WEBHOOK_BRANCH should trigger
+    getting that branch without needing a commit hash
+    """
+    git_url = "https://github.com/testorg/ocws-configs"
+    config_filenames = ["site-1/ocw-studio.yaml", "site-2/ocw-studio.yaml"]
+    release_branch = "release"
+    config_content = b"---\nroot-url-path: sites\ncollections: []"
+
+    mock_github.reset_mock()
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.side_effect = [
+        mocker.Mock(path=config_filenames[0], decoded_content=config_content),
+        mocker.Mock(path=config_filenames[1], decoded_content=config_content),
+    ]
+    settings.GITHUB_WEBHOOK_BRANCH = release_branch
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_branch.return_value.name = release_branch
+
+    sync_starter_configs(git_url, config_filenames)
+
+    mock_github.return_value.get_organization.return_value.get_repo.return_value.get_branch.assert_called_once_with(
+        release_branch
+    )
+
+    for config_file in config_filenames:
+        mock_github.return_value.get_organization.return_value.get_repo.return_value.get_contents.assert_any_call(
+            config_file, ref=release_branch
+        )
+
+
+def test_get_all_file_paths(mocker, mock_api_wrapper):
+    """get_all_file_paths should yield all file paths in the repo"""
+    mock_api_wrapper.org.get_repo.return_value.get_contents.side_effect = [
+        [
+            mocker.Mock(path="README.md", type="file"),
+            mocker.Mock(path="content", type="dir"),
+            mocker.Mock(path="data", type="dir"),
+        ],
+        [
+            mocker.Mock(path="content/pages", type="dir"),
+            mocker.Mock(path="content/resources", type="dir"),
+        ],
+        [
+            mocker.Mock(path="content/pages/page1.md", type="file"),
+            mocker.Mock(path="content/pages/page2.md", type="file"),
+        ],
+        [
+            mocker.Mock(path="content/resources/image1.md", type="file"),
+            mocker.Mock(path="content/resources/video1.md", type="file"),
+        ],
+        [
+            mocker.Mock(path="content/data/course.json", type="file"),
+        ],
+    ]
+    assert sorted(mock_api_wrapper.get_all_file_paths("/")) == [
+        "content/data/course.json",
+        "content/pages/page1.md",
+        "content/pages/page2.md",
+        "content/resources/image1.md",
+        "content/resources/video1.md",
+    ]
+
+
+@pytest.mark.parametrize("has_user", [True, False])
+def test_batch_delete_files(mocker, mock_api_wrapper, has_user):
+    """Batch delete multiple git files in a single commit"""
+    user = UserFactory.create() if has_user else None
+    mock_element = mocker.patch("content_sync.apis.github.InputGitTreeElement")
+    mock_git_user = mocker.patch("content_sync.apis.github.InputGitAuthor")
+    paths = [
+        "content/testpages/page1.md",
+        "content/testresources/video1.md",
+        "content/testresources/video2.md",
+    ]
+    mock_api_wrapper.batch_delete_files(paths, user=user)
+    tree_args = mock_api_wrapper.org.get_repo.return_value.create_git_tree.call_args[0][
+        0
+    ]
+    assert len(tree_args) == len(paths)
+    for path in paths:
+        mock_element.assert_any_call(
+            path,
+            "100644",
+            "blob",
+            sha=None,
+        )
+    mock_api_wrapper.org.get_repo.return_value.create_git_commit.assert_called_once_with(
+        "Sync all content",
+        mock_api_wrapper.org.get_repo.return_value.create_git_tree.return_value,
+        mocker.ANY,
+        committer=mocker.ANY,
+        author=mocker.ANY,
+    )
+    if has_user:
+        mock_git_user.assert_called_once_with(user.name, user.email)
+    else:
+        mock_git_user.assert_called_once_with(
+            settings.GIT_DEFAULT_USER_NAME, settings.GIT_DEFAULT_USER_EMAIL
+        )
+
+
+def test_batch_delete_files_none(mock_api_wrapper):
+    """batch_delete_files shouldn't call commit_tree for an empty path list"""
+    mock_api_wrapper.batch_delete_files([])
+    mock_api_wrapper.org.get_repo.assert_not_called()
+
+
+def test_find_files_recursive(mocker, mock_github):
+    """find_files_recursive should find ocw-studio.yaml files in a repo regardless of their directory level"""
+    config_content = b"---\nroot-url-path: sites\ncollections: []"
+
+    def get_content_side_effect(*args, **kwargs):
+        if kwargs["path"] == "":
+            return [
+                mocker.Mock(path="site-1", name="site-1", type="dir"),
+                mocker.Mock(path="site-2", name="site-2", type="dir"),
+            ]
+        elif kwargs["path"] == "site-1":
+            return [
+                mocker.Mock(
+                    path="site-1/ocw-studio.yaml",
+                    name="ocw-studio.yaml",
+                    type="file",
+                    decoded_content=config_content,
+                ),
+                mocker.Mock(
+                    path="site-1/unrelated-file.json",
+                    name="unrelated-file.json",
+                    type="file",
+                    decoded_content=config_content,
+                ),
+            ]
+        elif kwargs["path"] == "site-2":
+            return [
+                mocker.Mock(
+                    path="site-2/ocw-studio.yaml",
+                    name="ocw-studio.yaml",
+                    type="file",
+                    decoded_content=config_content,
+                ),
+            ]
+        return None
+
+    repo = mock_github.return_value.get_organization.return_value.get_repo.return_value
+    repo.get_contents.side_effect = get_content_side_effect
+    files = find_files_recursive(repo=repo, path="", file_name="ocw-studio.yaml")
+    assert files == ["site-1/ocw-studio.yaml", "site-2/ocw-studio.yaml"]
+
+
+@pytest.fixture
+def tag_release_repo(mocker, settings, mock_github):
+    """Mock a repo that is released as tags, with two starter configs in the tagged commit"""
+    settings.OCW_HUGO_TAG_RELEASES = True
+    settings.GITHUB_WEBHOOK_BRANCH = "release-candidate"
+    mocker.patch("content_sync.utils.is_dev", return_value=False)
+    repo = mock_github.return_value.get_organization.return_value.get_repo.return_value
+    repo.get_git_tree.return_value.tree = [
+        mocker.Mock(path="site-1/ocw-studio.yaml", type="blob"),
+        mocker.Mock(path="site-1/README.md", type="blob"),
+        mocker.Mock(path="site-2/ocw-studio.yaml", type="blob"),
+        mocker.Mock(path="site-2", type="tree"),
+        mocker.Mock(path="ocw-studio.yaml", type="tree"),
+    ]
+    repo.get_tags.return_value = [
+        SimpleNamespace(name=name)
+        for name in (
+            "2026.11.3.1",
+            "2026.11.2.1",
+            "2026.10.9.2",
+            "production/2026.11.2.1",
+            "production/2026.10.9.2",
+            "v1.164.0",
+            "abandoned/2026.11.3.2",
+        )
+    ]
+    repo.get_commit.return_value.sha = "abc123"
+    config_content = b"---\nroot-url-path: sites\ncollections: []"
+    repo.get_contents.side_effect = lambda path, *_args, **_kwargs: mocker.Mock(
+        path=path, decoded_content=config_content
+    )
+    return repo
+
+
+def test_sync_starter_configs_tag_release_syncs_every_config_in_the_tagged_commit(
+    tag_release_repo,
+):
+    """A matching tag push syncs each config file in the tagged commit, whatever the push lists"""
+    git_url = "https://github.com/testorg/ocws-configs"
+    sync_starter_configs(git_url, [], commit="abc123", tag="2026.11.3.1")
+    tag_release_repo.get_git_tree.assert_called_once_with("abc123", recursive=True)
+    tag_release_repo.get_branch.assert_not_called()
+    assert [call.args for call in tag_release_repo.get_contents.call_args_list] == [
+        ("site-1/ocw-studio.yaml", "abc123"),
+        ("site-2/ocw-studio.yaml", "abc123"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("webhook_branch", "tag", "commit"),
+    [
+        ("release-candidate", "production/2026.11.3.1", "abc123"),
+        ("release-candidate", "v1.164.0", "abc123"),
+        ("release-candidate", "2026.11.3.1\n", "abc123"),
+        ("release-candidate", None, "abc123"),
+        ("release", "2026.11.3.1", "abc123"),
+    ],
+)
+def test_sync_starter_configs_tag_release_ignores_other_pushes(
+    tag_release_repo, settings, webhook_branch, tag, commit
+):
+    """Branch pushes and tags that do not match the environment's pattern sync nothing"""
+    settings.GITHUB_WEBHOOK_BRANCH = webhook_branch
+    sync_starter_configs(
+        "https://github.com/testorg/ocws-configs", [], commit=commit, tag=tag
+    )
+    tag_release_repo.get_contents.assert_not_called()
+
+
+def test_sync_starter_configs_tag_release_production_pointer(
+    tag_release_repo, settings
+):
+    """The production pointer syncs on the newest production/ tag"""
+    settings.GITHUB_WEBHOOK_BRANCH = "release"
+    sync_starter_configs(
+        "https://github.com/testorg/ocws-configs",
+        [],
+        commit="abc123",
+        tag="production/2026.11.2.1",
+    )
+    assert tag_release_repo.get_contents.call_count == 2
+
+
+def test_sync_starter_configs_tag_release_reads_the_tag_when_no_commit_is_given(
+    tag_release_repo,
+):
+    """A manual import names only the tag, and reads the commit the tag points at"""
+    sync_starter_configs(
+        "https://github.com/testorg/ocws-configs", [], tag="2026.11.3.1"
+    )
+    tag_release_repo.get_commit.assert_called_once_with("2026.11.3.1")
+    tag_release_repo.get_git_tree.assert_called_once_with("abc123", recursive=True)
+    assert tag_release_repo.get_contents.call_count == 2
+
+
+@pytest.mark.parametrize("stale_tag", ["2026.11.2.1", "2026.10.9.2"])
+def test_sync_starter_configs_tag_release_ignores_an_older_tag(
+    tag_release_repo, stale_tag
+):
+    """A redelivered webhook for an older release must not overwrite the newest release's starters"""
+    sync_starter_configs(
+        "https://github.com/testorg/ocws-configs", [], commit="abc123", tag=stale_tag
+    )
+    tag_release_repo.get_git_tree.assert_not_called()
+    tag_release_repo.get_contents.assert_not_called()
+
+
+def test_sync_starter_configs_tag_release_ignores_a_commit_the_tag_does_not_point_at(
+    tag_release_repo,
+):
+    """The commit in the payload has to be the one the tag points at now"""
+    sync_starter_configs(
+        "https://github.com/testorg/ocws-configs",
+        [],
+        commit="def456",
+        tag="2026.11.3.1",
+    )
+    tag_release_repo.get_contents.assert_not_called()
+
+
+def test_get_newest_release_tag_orders_by_version(mocker):
+    """Tags sort by number, so 2026.11.10.1 is newer than 2026.11.9.2"""
+    repo = mocker.Mock()
+    repo.get_tags.return_value = [
+        SimpleNamespace(name=name)
+        for name in ("2026.11.9.2", "2026.11.10.1", "2026.2.28.4", "v9.9.9")
+    ]
+    assert get_newest_release_tag(repo, OCW_HUGO_RC_TAG_REGEX) == "2026.11.10.1"
+    repo.get_tags.return_value = []
+    assert get_newest_release_tag(repo, OCW_HUGO_RC_TAG_REGEX) is None
+
+
+def test_tag_sync_lock_is_released(mocker):
+    """The advisory lock is taken and released, also when the sync raises"""
+    mock_cursor = mocker.patch("content_sync.apis.github.connection.cursor")
+    cursor = mock_cursor.return_value.__enter__.return_value
+    with pytest.raises(RuntimeError), tag_sync_lock():  # noqa: PT012
+        msg = "boom"
+        raise RuntimeError(msg)
+    queries = [call.args[0] for call in cursor.execute.call_args_list]
+    assert queries == [
+        "SELECT pg_advisory_lock(%s)",
+        "SELECT pg_advisory_unlock(%s)",
+    ]

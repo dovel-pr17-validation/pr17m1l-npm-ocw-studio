@@ -1,0 +1,41 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["local>mitodl/.github:renovate-config"],
+  "pre-commit": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "matchManagers": ["custom.regex"],
+      "matchFileNames": [
+        "docker/ocw-course-publisher/Dockerfile",
+        "main/templates/base.html"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "mitol-drf-lint is an additional_dependencies pin on a `repo: local` hook, which autoupdate cannot see. Without this the pin never moves.",
+      "matchManagers": ["pre-commit"],
+      "matchPackageNames": ["mitol-drf-lint"],
+      "enabled": true
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^docker/ocw-course-publisher/Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>.+?)(?: packageName=(?<packageName>.+?))?(?: registryUrl=(?<registryUrl>.+?))?(?: versioning=(?<versioning>[a-z-]+?))?\\s*.+\\s*=\\s*\"(?<currentValue>.+?)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^main/templates/base\\.html$/"],
+      "matchStrings": [
+        "cdn\\.jsdelivr\\.net/npm/mathjax@(?<currentValue>[^/]+)/tex-svg\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "depNameTemplate": "mathjax"
+    }
+  ]
+}

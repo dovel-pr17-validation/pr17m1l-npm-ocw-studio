@@ -1,0 +1,19 @@
+.collaborator-table {
+  i {
+    vertical-align: middle;
+    padding-right: 10px;
+    cursor: pointer;
+  }
+
+  tr {
+    border: 1px solid $studio-gray;
+
+    td.gray {
+      color: $studio-gray;
+
+      a {
+        color: $studio-gray;
+      }
+    }
+  }
+}
